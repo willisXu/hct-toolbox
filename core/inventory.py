@@ -226,7 +226,10 @@ def _import_source(data: bytes, filename: str, system: str,
     elif system == SYSTEM_NETSUITE_663:
         location_col, item_col = col("地點"), col("DR_料號")
         expiry_col, available_col, total_col = col("庫存編號"), col("可用"), col("在庫量")
-        desc_col = col("項目")
+        # 2026-07 改版新增「顯示名稱」欄（正式品名），優先於「項目」（料號_序號）
+        desc_col = col("顯示名稱")
+        if desc_col is None:
+            desc_col = col("項目")
         field_names = ("地點", "DR_料號", "庫存編號", "可用", "在庫量")
         item_fallback_col = col("項目")
     else:

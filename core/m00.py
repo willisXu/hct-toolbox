@@ -26,9 +26,10 @@ from .shipping import (
     _REQUIRED_HEADERS,
     _add_distinct,
     _apply_aliases,
+    _batch_status_warning,
     _build_header_map,
     _cell,
-    _material_number,
+    _material_and_name,
     _normalize_arrival,
     _normalize_expiry,
     _phone_to_text,
@@ -163,7 +164,12 @@ def _build_groups(rows: list, headers: dict, mode: str) -> dict:
 
         batch_value = normalize_text(_cell(row, headers, "序號/批號"))
         item_text = normalize_text(_cell(row, headers, "項目"))
-        material = _material_number(_cell(row, headers, "DR_料號"), item_text)
+        material, name_fallback = _material_and_name(_cell(row, headers, "DR_料號"), item_text)
+        product_name = normalize_text(_cell(row, headers, "項目名稱")) or name_fallback
+
+        status_warning = _batch_status_warning(row, headers, row_number)
+        if status_warning:
+            _add_distinct(warnings, status_warning)
 
         def record_problem(reason: str) -> None:
             problem_rows.append({
@@ -172,7 +178,7 @@ def _build_groups(rows: list, headers: dict, mode: str) -> dict:
                 "銷售訂單單號": sales_order,
                 "項目": item_text,
                 "DR_料號": normalize_text(_cell(row, headers, "DR_料號")),
-                "項目名稱": normalize_text(_cell(row, headers, "項目名稱")),
+                "項目名稱": product_name,
                 "序號/批號": batch_value,
                 "出貨數量": normalize_text(_cell(row, headers, "出貨數量")),
                 "排除原因": reason,

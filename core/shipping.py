@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import io
+import re
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -27,20 +28,23 @@ OUTPUT_COLUMN_COUNT = 36
 MODE_ORDER = "order"       # 銷售訂單未出貨明細 (360)
 MODE_TRANSFER = "transfer"  # 調撥單未出貨明細 (162)
 
+# 每個標準欄名可對應多個候選別名，依序取第一個存在的欄
+#（2026-07 NetSuite 報表改版：項目名稱→顯示名稱、備忘錄→備忘錄 (主要)）。
 _ALIASES = {
     MODE_ORDER: {
-        "項目名稱": "顯示名稱",
-        "序號/批號": "交易序號/批號",
-        "DR_溫馨提醒": "備忘錄",
+        "項目名稱": ("顯示名稱",),
+        "序號/批號": ("交易序號/批號",),
+        "DR_溫馨提醒": ("備忘錄", "備忘錄 (主要)"),
     },
     MODE_TRANSFER: {
-        "序號/批號": "交易序號/批號",
-        "DR_溫馨提醒": "備忘錄",
-        "出貨客戶": "目標地點",
-        "門市/倉儲": "倉儲",
-        "門市/倉儲聯繫人": "倉儲聯繫人",
-        "門市/倉儲電話": "倉儲電話",
-        "門市/倉儲地址": "倉儲地址",
+        "項目名稱": ("顯示名稱",),
+        "序號/批號": ("交易序號/批號",),
+        "DR_溫馨提醒": ("備忘錄", "備忘錄 (主要)"),
+        "出貨客戶": ("目標地點",),
+        "門市/倉儲": ("倉儲",),
+        "門市/倉儲聯繫人": ("倉儲聯繫人",),
+        "門市/倉儲電話": ("倉儲電話",),
+        "門市/倉儲地址": ("倉儲地址",),
     },
 }
 
@@ -153,11 +157,15 @@ def _build_header_map(header_row: list) -> dict[str, int]:
 
 
 def _apply_aliases(headers: dict[str, int], mode: str) -> None:
-    for canonical, alias in _ALIASES[mode].items():
+    for canonical, aliases in _ALIASES[mode].items():
         key = canonical.casefold()
-        alias_key = alias.casefold()
-        if key not in headers and alias_key in headers:
-            headers[key] = headers[alias_key]
+        if key in headers:
+            continue
+        for alias in aliases:
+            alias_key = alias.casefold()
+            if alias_key in headers:
+                headers[key] = headers[alias_key]
+                break
 
 
 def _cell(row: list, headers: dict[str, int], name: str) -> object:
@@ -197,16 +205,42 @@ def _normalize_expiry(batch_text: str) -> tuple[str, object, str]:
     return "", None, f"效期無法辨識，已留白：{batch_text}"
 
 
-def _material_number(dr_material: object, item_text: object) -> str:
+# 「項目」欄的「料號直接連品名」樣態（2026-07 備品列新增）：開頭一串數字
+# 料號後面直接接品名文字，如 902224100008ㄈ型試用品壓克力架(圓管)。
+_ITEM_CODE_NAME_RE = re.compile(r"^(\d{6,})\s*(\D.*)$")
+
+
+def _material_and_name(dr_material: object, item_text: object) -> tuple[str, str]:
+    """從 DR_料號／項目 解析 (料號, 品名備援)。
+
+    DR_料號空白時退回「項目」欄，該欄有三種樣態：
+    料號_序號（取底線前段）、純料號、料號直接連品名（拆開後品名當備援）。
+    """
     material = normalize_text(dr_material)
     if material:
-        return material
+        return material, ""
     fallback = normalize_text(item_text)
+    matched = _ITEM_CODE_NAME_RE.match(fallback)
     if "_" in fallback:
         head = fallback.split("_", 1)[0]
         if head:
             fallback = head
-    return fallback.strip()
+    elif matched:
+        return matched.group(1), matched.group(2).strip()
+    return fallback.strip(), ""
+
+
+BATCH_STATUS_OK = "批號賦予成功"
+
+
+def _batch_status_warning(row: list, headers: dict[str, int], row_number: int) -> str:
+    """調撥單報表的 DR_程式執行狀態非「批號賦予成功」時給警告（欄位不存在則略過）。"""
+    if "DR_程式執行狀態".casefold() not in headers:
+        return ""
+    status = normalize_text(_cell(row, headers, "DR_程式執行狀態"))
+    if status and status != BATCH_STATUS_OK:
+        return f"第 {row_number} 列批號狀態為「{status}」，批號/效期可能尚未確認。"
+    return ""
 
 
 def _positive_quantity(value: object) -> float | None:
@@ -380,7 +414,13 @@ def _add_row_to_shipment(
 
     batch_value = normalize_text(_cell(row, headers, "序號/批號"))
     item_text = normalize_text(_cell(row, headers, "項目"))
-    material = _material_number(_cell(row, headers, "DR_料號"), item_text)
+    material, name_fallback = _material_and_name(_cell(row, headers, "DR_料號"), item_text)
+    product_name = normalize_text(_cell(row, headers, "項目名稱")) or name_fallback
+
+    status_warning = _batch_status_warning(row, headers, row_number)
+    if status_warning:
+        _add_distinct(warnings, status_warning)
+        _add_distinct(shipment.warnings, status_warning)
 
     def record_problem(reason: str) -> None:
         problem_rows.append({
@@ -390,7 +430,7 @@ def _add_row_to_shipment(
             "銷售訂單類型": order_type,
             "項目": item_text,
             "DR_料號": normalize_text(_cell(row, headers, "DR_料號")),
-            "項目名稱": normalize_text(_cell(row, headers, "項目名稱")),
+            "項目名稱": product_name,
             "序號/批號": batch_value,
             "出貨數量": normalize_text(_cell(row, headers, "出貨數量")),
             "出貨客戶": shipment.customer,
@@ -428,7 +468,7 @@ def _add_row_to_shipment(
     else:
         shipment.items[item_key] = {
             "material": material,
-            "product_name": normalize_text(_cell(row, headers, "項目名稱")),
+            "product_name": product_name,
             "batch": batch_value,
             "expiry_value": expiry_value,
             "expiry_key": expiry_key,
