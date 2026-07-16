@@ -502,9 +502,18 @@ def _order_number(shipment: Shipment, mode: str) -> str:
 
 
 _TEXT_COLUMNS = (3, 5, 7, 11, 13, 15)
-_DATE_COLUMNS = (29, 33)
-_EXPIRY_COLUMN = 33  # 效期欄顯示為 yyyy/m/d（月日不補零），其他日期欄維持 yyyy-mm-dd
+# 對齊 HCT 可匯入範本（260716銷貨-1 NS-水嫩.xlsx）：
+#   指定送達日(29) = 文字字串 YYYY-MM-DD；效期(33) = 日期值 + Excel 內建
+#   短日期格式（格式代碼 14，openpyxl 表示為 mm-dd-yy，zh-TW 顯示 yyyy/m/d）。
+_EXPIRY_COLUMN = 33
+_EXPIRY_FORMAT = "mm-dd-yy"
 _TEMPLATE_VALUE_COLUMNS = (4, 20, 21, 22, 23, 25, 26, 27, 30, 31, 32, 34)
+
+
+def _arrival_text(value: object) -> str:
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    return "" if value is None else str(value)
 
 
 def _write_output(state: dict, mode: str, template_path: Path) -> bytes:
@@ -564,25 +573,21 @@ def _write_output(state: dict, mode: str, template_path: Path) -> bytes:
                 values[col] = template_values[col]
             values[24] = CARRIER_NAME
             values[28] = ""
-            values[29] = shipment.arrival_value
+            values[29] = _arrival_text(shipment.arrival_value)
             values[33] = item["expiry_value"]
             values[35] = shipment.customer
             values[36] = 1
             for col in range(1, OUTPUT_COLUMN_COUNT + 1):
                 cell = ws.cell(row_index, col)
                 value = values[col]
-                date_format = "yyyy/m/d" if col == _EXPIRY_COLUMN else "yyyy-mm-dd"
                 if isinstance(value, date):
                     cell.value = value
-                    cell.number_format = date_format
+                    cell.number_format = _EXPIRY_FORMAT if col == _EXPIRY_COLUMN else "yyyy-mm-dd"
+                elif col in _TEXT_COLUMNS:
+                    cell.number_format = "@"
+                    cell.value = "" if value is None else str(value)
                 else:
-                    if col in _TEXT_COLUMNS:
-                        cell.number_format = "@"
-                        cell.value = "" if value is None else str(value)
-                    else:
-                        cell.value = value
-                if col in _DATE_COLUMNS and not isinstance(value, date):
-                    cell.number_format = date_format
+                    cell.value = value
 
     ws.auto_filter.ref = f"A1:AJ{row_index}"
     ws.freeze_panes = "A2"
