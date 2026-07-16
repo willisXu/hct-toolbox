@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 建置產物（本機打包 exe 用，不需上雲）
+build/
+dist/
+build_venv/
+release/
+build_log.txt
+
+# 執行時輸出
+outputs/
+
+# Claude Code
+.claude/
