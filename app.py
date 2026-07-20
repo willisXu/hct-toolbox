@@ -222,7 +222,10 @@ with tab_netsuite:
             preview.insert(0, "選取", True)
             edited = st.data_editor(
                 preview,
-                key="ns_editor",
+                # key 隨資料集（saved search + 筆數）變化，換一批資料時強制
+                # Streamlit 重建 widget，避免沿用前一批資料殘留的勾選狀態
+                # 套到新資料對應位置的列上，悄悄漏掉使用者以為有勾選的列。
+                key=f"ns_editor_{ns_label}_{len(ns_rows)}",
                 use_container_width=True,
                 hide_index=True,
                 disabled=[c for c in preview.columns if c != "選取"],

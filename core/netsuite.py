@@ -94,11 +94,18 @@ class NetSuiteClient:
         在單次執行內抓完所有分頁而撞到 NetSuite 系統層級的執行單位上限
         （這種系統層級中斷連 RESTlet 自己的 try/catch 都攔不到，呼叫端只會
         看到籠統的 UNEXPECTED_ERROR）。
+
+        每一頁都是獨立呼叫、各自重新 search.load()/runPaged()，不是同一個
+        伺服器端游標；如果 saved search 底層資料在抓頁之間被改動（正式區
+        隨時可能有人異動單據），pageCount 會跟著變，跨頁組出來的結果就可能
+        不一致。這裡偵測到 pageCount 中途變動就直接報錯，請使用者重新抓取，
+        避免悄悄回傳漏列/重複列的資料。
         """
         columns: list[object] | None = None
         data_rows: list[list[object]] = []
         page = 0
         page_count = 1
+        expected_page_count: int | None = None
 
         while page < page_count:
             if page >= max_pages:
@@ -138,6 +145,13 @@ class NetSuiteClient:
                 columns = payload.get("columns") or []
             data_rows.extend(payload.get("rows") or [])
             page_count = payload.get("pageCount") or 1
+            if expected_page_count is None:
+                expected_page_count = page_count
+            elif page_count != expected_page_count:
+                raise NetSuiteError(
+                    f"saved search「{search_id}」在分頁抓取途中資料筆數發生變化"
+                    "（可能有人同時異動了單據），為避免抓到不一致的結果，請重新抓取一次。"
+                )
             page += 1
 
         if not columns or not data_rows:
