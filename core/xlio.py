@@ -178,6 +178,15 @@ def try_parse_date(value: object) -> date | None:
     if isinstance(value, date):
         return value
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # 8 碼數字可能是 YYYYMMDD（例如某些欄位被存成數字型別而非文字），
+        # 跟 Excel 序號範圍（最大 2958466，只有 7 碼）不重疊，先試著當
+        # YYYYMMDD 解析；不是合法日期（例如月份超過 12）才退回序號判斷。
+        if value == int(value) and 10000000 <= int(value) <= 99999999:
+            int_value = int(value)
+            try:
+                return date(int_value // 10000, (int_value // 100) % 100, int_value % 100)
+            except ValueError:
+                pass
         if 0 < value < 2958466:
             return _from_serial(float(value))
         return None
