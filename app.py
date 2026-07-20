@@ -189,7 +189,7 @@ with tab_netsuite:
     st.subheader("Saved Search → 直接抓取轉換")
     st.markdown(
         "1. 選擇要抓取的 saved search，按「抓取資料」\n"
-        "2. 抓回後可在表格勾選要轉換的列（預設全選）\n"
+        "2. 抓回後可在表格勾選要轉換的列（預設全選；也可用「全選」「取消全選」批量調整）\n"
         "3. 選擇輸出格式，按「開始轉換」，完成後點「下載結果」"
     )
     searches = _load_saved_searches()
@@ -218,19 +218,47 @@ with tab_netsuite:
             ns_rows, ns_mode, ns_label = fetched
             st.success(f"已抓取「{ns_label}」共 {len(ns_rows) - 1} 筆資料列。")
 
+            # nonce 隨資料集（saved search + 筆數）變化，「全選/取消全選」
+            # 每次按下都會讓 nonce +1、換一組新的 data_editor key，強制
+            # Streamlit 重建 widget、整批套用新的勾選狀態（即使兩次都按
+            # 同一個按鈕，也要蓋掉使用者中途手動勾/取消的個別列）。
+            default_key = f"ns_select_default_{ns_label}_{len(ns_rows)}"
+            nonce_key = f"ns_select_nonce_{ns_label}_{len(ns_rows)}"
+            if default_key not in st.session_state:
+                st.session_state[default_key] = True
+                st.session_state[nonce_key] = 0
+
+            btn_col1, btn_col2, _btn_col3 = st.columns([1, 1, 5])
+            with btn_col1:
+                if st.button("☑️ 全選", key="ns_select_all", use_container_width=True):
+                    st.session_state[default_key] = True
+                    st.session_state[nonce_key] += 1
+            with btn_col2:
+                if st.button("⬜ 取消全選", key="ns_deselect_all", use_container_width=True):
+                    st.session_state[default_key] = False
+                    st.session_state[nonce_key] += 1
+
             preview = pd.DataFrame(ns_rows[1:], columns=[str(c) for c in ns_rows[0]])
-            preview.insert(0, "選取", True)
+            preview.insert(0, "選取", st.session_state[default_key])
+            editor_key = f"ns_editor_{ns_label}_{len(ns_rows)}_{st.session_state[nonce_key]}"
             edited = st.data_editor(
                 preview,
-                # key 隨資料集（saved search + 筆數）變化，換一批資料時強制
-                # Streamlit 重建 widget，避免沿用前一批資料殘留的勾選狀態
-                # 套到新資料對應位置的列上，悄悄漏掉使用者以為有勾選的列。
-                key=f"ns_editor_{ns_label}_{len(ns_rows)}",
+                # key 隨資料集、以及「全選/取消全選」的 nonce 變化，兩者任一
+                # 改變都強制 Streamlit 重建 widget，避免殘留前一批資料或
+                # 前一次個別勾選狀態，悄悄漏掉使用者以為有勾選的列。
+                key=editor_key,
                 use_container_width=True,
                 hide_index=True,
+                height=420,
                 disabled=[c for c in preview.columns if c != "選取"],
-                column_config={"選取": st.column_config.CheckboxColumn("選取", default=True)},
+                column_config={
+                    "選取": st.column_config.CheckboxColumn(
+                        "✅ 選取", default=True, width="small", help="勾選要轉換的資料列"
+                    ),
+                },
             )
+            selected_count = int(edited["選取"].sum())
+            st.caption(f"已勾選 **{selected_count}** / 共 **{len(edited)}** 筆")
 
             st.markdown("**輸出格式**")
             ns_format = st.radio(
