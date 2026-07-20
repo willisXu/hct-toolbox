@@ -1,12 +1,14 @@
 # NetSuite saved search 對照表 — HCT 工具箱「NetSuite 直接抓取」分頁用。
 # mode: order = 銷售訂單未出貨明細（走訂單轉換規則）
 #       transfer = 調撥單未出貨明細（走調撥單轉換規則）
-# search_id 填 NetSuite saved search 編輯頁網址列的 id=customsearchXXX。
+# search_id 填 NetSuite saved search 編輯頁網址列 id= 後面的值——可能是
+# customsearchXXX 別名，也可能是純數字的內部 ID（兩種 search.load() 都吃，
+# 但務必跟你實際打開來看的那個 saved search 網址列一致，兩者不一定相同）。
 
 - label: "銷售訂單未出貨明細"
   search_id: "customsearch517"
   mode: order
 
 - label: "調撥單未出貨明細"
-  search_id: "customsearch519"
+  search_id: "159"
   mode: transfer
