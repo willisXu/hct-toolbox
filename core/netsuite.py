@@ -6,7 +6,8 @@
 NetSuite 裡的 RESTlet。RESTlet 一次只回傳一頁（見
 netsuite_restlet/saved_search_restlet.js），逐頁回傳
 {"columns": [...], "rows": [[...], ...], "page": N, "pageCount": M}；
-run_saved_search() 逐頁呼叫、組成 [header 列] + 所有資料列，格式對齊
+run_saved_search() 逐頁呼叫、組成 [header 列] + 所有資料列，並把 header
+裡常見的英文預設欄名（Document Number、Date 等）轉成中文欄名，格式對齊
 本地上傳檔案的讀取結果。
 """
 from __future__ import annotations
@@ -27,6 +28,26 @@ def _pct(s: str) -> str:
 
 class NetSuiteError(ValueError):
     pass
+
+
+# saved search 欄位若沒有在 NetSuite 設定自訂 Label，search.load() 回傳的
+# col.label 會是該欄位的英文預設名稱，跟手動匯出檔案的中文欄名對不上
+# （既有轉換邏輯認的是中文欄名）。這裡把常見的英文預設名稱轉成對應中文欄名。
+_HEADER_ALIASES = {
+    "document number": "文件編號",
+    "date": "日期",
+    "internal id": "內部 ID",
+    "item": "項目",
+}
+
+
+def _normalize_headers(rows: list[list[object]]) -> list[list[object]]:
+    if not rows:
+        return rows
+    header = [
+        _HEADER_ALIASES.get(str(h).strip().casefold(), h) for h in rows[0]
+    ]
+    return [header] + rows[1:]
 
 
 class NetSuiteClient:
@@ -121,4 +142,4 @@ class NetSuiteClient:
 
         if not columns or not data_rows:
             raise NetSuiteError(f"saved search「{search_id}」沒有回傳任何資料列。")
-        return [list(columns)] + data_rows
+        return _normalize_headers([list(columns)] + data_rows)
