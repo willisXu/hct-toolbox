@@ -153,6 +153,11 @@ def is_excel_error_text(value: object) -> bool:
     return isinstance(value, str) and value.strip().upper() in _EXCEL_ERROR_VALUES
 
 
+def is_blank_row(row: list) -> bool:
+    """整列每一格 normalize 後都是空字串（NetSuite 匯出檔尾端常見的空白列）。"""
+    return all(not normalize_text(value) for value in row)
+
+
 def normalize_text(value: object) -> str:
     """VBA NormalizeText：IsError/IsNull/IsEmpty 視為空白、換行改空白、去頭尾空白。"""
     if value is None or is_excel_error_text(value):

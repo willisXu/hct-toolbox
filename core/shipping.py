@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
-from .xlio import first_sheet, normalize_text, read_workbook, try_parse_date
+from .xlio import first_sheet, is_blank_row, normalize_text, read_workbook, try_parse_date
 
 GENERAL_ORDER_TYPE = "一般銷售訂單"
 PLATFORM_NAME = "DR.WU 達爾膚生醫科技股份有限公司"
@@ -294,7 +294,7 @@ def _split_postal(raw_address: str) -> tuple[str, str]:
 def _build_shipments(rows: list, headers: dict[str, int], mode: str) -> dict:
     warnings: list[str] = []
     problem_rows: list[dict] = []
-    input_rows = len(rows) - 1
+    input_rows = sum(1 for row in rows[1:] if not is_blank_row(row))
     skipped_rows = 0
 
     candidate_types: dict[tuple, list[str]] = {}
@@ -327,6 +327,8 @@ def _build_shipments(rows: list, headers: dict[str, int], mode: str) -> dict:
     shipments: dict[tuple, Shipment] = {}
 
     for row_number, row in enumerate(rows[1:], start=2):
+        if is_blank_row(row):
+            continue
         key = candidate_key_for(row)
         mergeable = all(key)
 

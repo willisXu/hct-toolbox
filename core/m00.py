@@ -36,7 +36,7 @@ from .shipping import (
     _positive_quantity,
     _split_postal,
 )
-from .xlio import first_sheet, normalize_text, read_workbook
+from .xlio import first_sheet, is_blank_row, normalize_text, read_workbook
 
 FIXED_PRODUCT_STATUS = "良品"
 FIXED_SHIP_METHOD = "件出"
@@ -128,11 +128,13 @@ def convert(data: bytes, filename: str, mode: str, template_path: Path) -> M00Re
 def _build_groups(rows: list, headers: dict, mode: str) -> dict:
     warnings: list[str] = []
     problem_rows: list[dict] = []
-    input_rows = len(rows) - 1
+    input_rows = sum(1 for row in rows[1:] if not is_blank_row(row))
     skipped_rows = 0
     groups: dict[str, M00Group] = {}
 
     for row_number, row in enumerate(rows[1:], start=2):
+        if is_blank_row(row):
+            continue
         document = normalize_text(_cell(row, headers, "文件編號"))
         if not document:
             document = "ID-" + normalize_text(_cell(row, headers, "內部 ID"))
