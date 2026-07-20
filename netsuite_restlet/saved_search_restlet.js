@@ -19,7 +19,7 @@ define(['N/search'], function (search) {
     function get(context) {
         var searchId = context.searchId;
         if (!searchId) {
-            return { error: true, name: 'MISSING_PARAM', message: '缺少 searchId 參數' };
+            return JSON.stringify({ error: true, name: 'MISSING_PARAM', message: '缺少 searchId 參數' });
         }
         var page = parseInt(context.page, 10);
         if (isNaN(page) || page < 0) {
@@ -51,18 +51,21 @@ define(['N/search'], function (search) {
                 });
             }
 
-            return { columns: columns, rows: rows, page: page, pageCount: pageCount };
+            // RESTlet 的 get() 規定要回傳字串（"Invalid data format. You should
+            // return text." 是回傳原始物件時 NetSuite 丟出的錯誤），所以自己
+            // JSON.stringify 再回傳，呼叫端用 resp.json() 解析一樣能還原成物件。
+            return JSON.stringify({ columns: columns, rows: rows, page: page, pageCount: pageCount });
         } catch (e) {
             // 包住所有例外自己回傳細節，避免 NetSuite 把原始錯誤壓成籠統的
             // UNEXPECTED_ERROR，讓呼叫端看不出真正原因（權限不足、欄位不存在等）。
             // 注意：governance/執行時間超限屬於系統層級中斷，這層 catch 攔不到，
             // 呼叫端仍會看到系統的 UNEXPECTED_ERROR——這正是改成分頁抓取要解決的問題。
-            return {
+            return JSON.stringify({
                 error: true,
                 name: e.name || 'UNKNOWN_ERROR',
                 message: e.message || String(e),
                 stack: e.stack || null,
-            };
+            });
         }
     }
 
