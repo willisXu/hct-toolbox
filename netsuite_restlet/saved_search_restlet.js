@@ -15,32 +15,43 @@ define(['N/search'], function (search) {
     function get(context) {
         var searchId = context.searchId;
         if (!searchId) {
-            throw new Error('缺少 searchId 參數');
+            return { error: true, name: 'MISSING_PARAM', message: '缺少 searchId 參數' };
         }
 
-        var loadedSearch = search.load({ id: searchId });
-        var columns = loadedSearch.columns.map(function (col) {
-            return col.label || col.name;
-        });
-
-        var rows = [columns];
-        var pagedData = loadedSearch.runPaged({ pageSize: 1000 });
-        pagedData.pageRanges.forEach(function (pageRange) {
-            var page = pagedData.fetch({ index: pageRange.index });
-            page.data.forEach(function (result) {
-                var rowValues = loadedSearch.columns.map(function (col) {
-                    var text = result.getText(col);
-                    if (text !== null && text !== undefined && text !== '') {
-                        return text;
-                    }
-                    var value = result.getValue(col);
-                    return value === undefined ? null : value;
-                });
-                rows.push(rowValues);
+        try {
+            var loadedSearch = search.load({ id: searchId });
+            var columns = loadedSearch.columns.map(function (col) {
+                return col.label || col.name;
             });
-        });
 
-        return { columns: columns, rows: rows };
+            var rows = [columns];
+            var pagedData = loadedSearch.runPaged({ pageSize: 1000 });
+            pagedData.pageRanges.forEach(function (pageRange) {
+                var page = pagedData.fetch({ index: pageRange.index });
+                page.data.forEach(function (result) {
+                    var rowValues = loadedSearch.columns.map(function (col) {
+                        var text = result.getText(col);
+                        if (text !== null && text !== undefined && text !== '') {
+                            return text;
+                        }
+                        var value = result.getValue(col);
+                        return value === undefined ? null : value;
+                    });
+                    rows.push(rowValues);
+                });
+            });
+
+            return { columns: columns, rows: rows };
+        } catch (e) {
+            // 包住所有例外自己回傳細節，避免 NetSuite 把原始錯誤壓成籠統的
+            // UNEXPECTED_ERROR，讓呼叫端看不出真正原因（權限不足、欄位不存在等）。
+            return {
+                error: true,
+                name: e.name || 'UNKNOWN_ERROR',
+                message: e.message || String(e),
+                stack: e.stack || null,
+            };
+        }
     }
 
     return { get: get };

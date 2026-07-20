@@ -82,6 +82,12 @@ class NetSuiteClient:
         except ValueError as exc:
             raise NetSuiteError(f"NetSuite RESTlet 回應不是有效的 JSON：{resp.text[:1000]}") from exc
 
+        if isinstance(payload, dict) and payload.get("error"):
+            raise NetSuiteError(
+                f"NetSuite saved search「{search_id}」執行失敗"
+                f"（{payload.get('name', 'UNKNOWN_ERROR')}）：{payload.get('message', '未知錯誤')}"
+            )
+
         rows = payload.get("rows") if isinstance(payload, dict) else None
         if not rows:
             raise NetSuiteError(f"saved search「{search_id}」沒有回傳任何資料列。")
