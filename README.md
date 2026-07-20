@@ -8,6 +8,7 @@
 | 🔄 調撥單轉換 | NetSuite 調撥單未出貨明細 → HCT 銷貨報表 / M00 出貨格式 |
 | 🔗 NetSuite 直接抓取 | 免手動匯出：選 saved search → 抓資料 → 勾選要轉換的列 → 轉換 |
 | 🔍 表格核對 | 未出貨明細 × 銷貨單明細，數量與訂單編號核對 |
+| 🔁 退貨核對 | 客戶退貨授權明細（NetSuite RA）× HCT 退貨入庫格式，料號＋效期數量核對 |
 | 📊 庫存核對 | HCT × NetSuite 庫存報表核對（G00/G10/G30/G40/G80/G90 倉） |
 
 ## NetSuite 直接抓取設定
@@ -36,11 +37,12 @@ streamlit run app.py
 ## 專案結構
 
 ```
-app.py              # Streamlit 介面（五個分頁）
+app.py              # Streamlit 介面（六個分頁）
 core/
   shipping.py       # 訂單/調撥單 → HCT 銷貨報表（convert 讀檔、convert_rows 共用轉換邏輯）
   m00.py            # 訂單/調撥單 → M00 出貨格式（同上）
   compare.py        # 表格核對
+  return_compare.py # 退貨核對（客戶退貨授權明細 × HCT 退貨入庫格式）
   inventory.py      # 庫存核對
   xlio.py           # Excel 讀寫（NS 的 .xls 是 XML、HCT 的 .xls 是 BIFF）
   netsuite.py       # NetSuite REST OAuth 1.0 (TBA) 客戶端，呼叫 saved search RESTlet

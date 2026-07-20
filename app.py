@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """HCT 工具箱 — 四合一網頁介面（Streamlit）。
 
-四個功能分頁，對應原本四份 Excel VBA 工具：
+分頁對應原本的 Excel VBA 工具，另外加了 NetSuite 直接抓取與退貨核對：
   1. 訂單轉換     ← HCT出貨單轉換程式(訂單)
   2. 調撥單轉換   ← HCT出貨單轉換程式(調撥單)
   3. 表格核對     ← HCT表格核對工具
-  4. 庫存核對     ← 庫存核對工具
+  4. 退貨核對     ← 客戶退貨授權明細 × HCT 退貨入庫格式
+  5. 庫存核對     ← 庫存核對工具
 
 注意：轉換結果一律存進 st.session_state 再顯示。
 按下載鈕時 Streamlit 會整頁重跑，若結果只活在「開始轉換」的 if 區塊裡,
@@ -25,6 +26,7 @@ from core import compare as compare_mod
 from core import inventory as inventory_mod
 from core import m00 as m00_mod
 from core import netsuite as netsuite_mod
+from core import return_compare as return_compare_mod
 from core import shipping
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -44,7 +46,7 @@ EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 st.set_page_config(page_title="HCT 工具箱", page_icon="📦", layout="wide")
 
 st.title("📦 HCT 工具箱")
-st.caption("訂單轉換 / 調撥單轉換 / 表格核對 / 庫存核對 — 上傳檔案 → 按按鈕 → 下載結果")
+st.caption("訂單轉換 / 調撥單轉換 / 表格核對 / 退貨核對 / 庫存核對 — 上傳檔案 → 按按鈕 → 下載結果")
 
 
 def _save_output(name: str, data: bytes) -> str:
@@ -138,8 +140,8 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
                 st.text(f"• {warning}")
 
 
-tab_order, tab_transfer, tab_netsuite, tab_compare, tab_inventory = st.tabs(
-    ["🛒 訂單轉換", "🔄 調撥單轉換", "🔗 NetSuite 直接抓取", "🔍 表格核對", "📊 庫存核對"]
+tab_order, tab_transfer, tab_netsuite, tab_compare, tab_return, tab_inventory = st.tabs(
+    ["🛒 訂單轉換", "🔄 調撥單轉換", "🔗 NetSuite 直接抓取", "🔍 表格核對", "🔁 退貨核對", "📊 庫存核對"]
 )
 
 with tab_order:
@@ -365,6 +367,53 @@ with tab_compare:
             file_name=result.output_name,
             mime=EXCEL_MIME,
             key="cmp_download",
+        )
+        if saved_path:
+            st.caption(f"已同時存一份到：{saved_path}")
+
+# ------------------------------------------------------------ 退貨核對
+
+with tab_return:
+    st.subheader("客戶退貨授權明細 × HCT 退貨入庫格式 核對")
+    st.markdown(
+        "上傳 **客戶退貨授權明細報表**（NetSuite RA）與 **HCT 退貨入庫格式** 各一份"
+        "（順序不限，程式會自動辨識），以「料號＋效期」加總數量核對退貨是否入庫。\n\n"
+        "兩邊沒有可以互相對應的單號欄位，因此不核對單號，只核對數量。"
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        ret_a = st.file_uploader("檔案一", type=["xls", "xlsx", "xlsm"], key="ret_a")
+    with col2:
+        ret_b = st.file_uploader("檔案二", type=["xls", "xlsx", "xlsm"], key="ret_b")
+
+    if ret_a is not None and ret_b is not None:
+        if st.button("🚀 開始核對", key="ret_run", type="primary"):
+            try:
+                with st.spinner("核對中..."):
+                    result = return_compare_mod.compare(
+                        ret_a.getvalue(), ret_a.name,
+                        ret_b.getvalue(), ret_b.name,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.pop("ret_result", None)
+                _show_error(exc)
+            else:
+                saved_path = _save_output(result.output_name, result.output_bytes)
+                st.session_state["ret_result"] = (result, saved_path)
+
+    stored = st.session_state.get("ret_result")
+    if stored:
+        result, saved_path = stored
+        st.success(f"核對完成！共 **{result.total_rows}** 筆料號＋效期組合。")
+        metric_cols = st.columns(4)
+        for idx, status in enumerate(["一致", "數量不符", "僅退貨授權", "僅入庫記錄"]):
+            metric_cols[idx].metric(status, result.status_counts.get(status, 0))
+        st.download_button(
+            f"⬇️ 下載核對結果（{result.output_name}）",
+            data=result.output_bytes,
+            file_name=result.output_name,
+            mime=EXCEL_MIME,
+            key="ret_download",
         )
         if saved_path:
             st.caption(f"已同時存一份到：{saved_path}")
