@@ -11,11 +11,13 @@
    - Log Level：Error（或依需求）
    - Audience：至少要包含會呼叫這支 API 的角色/使用者（通常是產生 Token 的那個角色）
    - 儲存後記下網址列的 **script=** 與 **deploy=** 數字（例如 `script=1090&deploy=1`）。
-4. 完整 RESTlet URL 會長這樣（帳號 ID 依 sandbox / 正式區而不同）：
+4. 完整 RESTlet URL（正式區帳號 `11776409`）：
+
+   ```text
+   https://11776409.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=<Script ID>&deploy=<Deploy ID>
    ```
-   https://<帳號ID小寫、底線改連字號>.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=<Script ID>&deploy=<Deploy ID>
-   ```
-   例如帳號 `11776409_SB1` → `https://11776409-sb1.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=1090&deploy=1`
+
+   目前正式區已部署：`https://11776409.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=388&deploy=1`
 5. 確認呼叫此 RESTlet 的角色（Token 綁定的角色）有權限「執行」該 script，且對要查的 saved search 所屬的 record type 有 View 權限。
 
 ## 設定回 HCT 工具箱
