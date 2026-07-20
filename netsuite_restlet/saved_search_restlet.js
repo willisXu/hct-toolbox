@@ -1,5 +1,5 @@
 /**
- * @NApiVersion 2.1
+ * @NApiVersion 2.0
  * @NScriptType Restlet
  *
  * 依 searchId 執行既有的 saved search，一次只回傳一頁（最多 500 列），
