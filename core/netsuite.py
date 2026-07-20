@@ -3,8 +3,11 @@
 
 沿用「NS 匯入程式」工具的 core/netsuite.py（已在 sandbox / 正式區實測），
 簽章邏輯不動；這裡只加一個 run_saved_search()，呼叫使用者自行部署在
-NetSuite 裡的 RESTlet（RESTlet 需回傳 {"columns": [...], "rows": [[...], ...]}，
-rows[0] 為欄位標題、其餘為資料列，格式對齊本地上傳檔案的讀取結果）。
+NetSuite 裡的 RESTlet。RESTlet 一次只回傳一頁（見
+netsuite_restlet/saved_search_restlet.js），逐頁回傳
+{"columns": [...], "rows": [[...], ...], "page": N, "pageCount": M}；
+run_saved_search() 逐頁呼叫、組成 [header 列] + 所有資料列，格式對齊
+本地上傳檔案的讀取結果。
 """
 from __future__ import annotations
 
@@ -60,35 +63,62 @@ class NetSuiteClient:
         header = ", ".join(f'{k}="{_pct(v)}"' for k, v in sorted(oauth.items()))
         return f'OAuth realm="{self.account}", {header}'
 
-    def run_saved_search(self, restlet_url: str, search_id: str) -> list[list[object]]:
-        """呼叫已部署的 saved-search RESTlet，回傳 rows（header 列 + 資料列）。"""
-        sep = "&" if "?" in restlet_url else "?"
-        url = f"{restlet_url}{sep}searchId={_pct(search_id)}"
-        try:
-            resp = requests.get(
-                url,
-                headers={"Authorization": self._auth_header("GET", url)},
-                timeout=120,
-            )
-        except requests.RequestException as exc:
-            raise NetSuiteError(f"連線 NetSuite 失敗：{exc}") from exc
+    def run_saved_search(
+        self, restlet_url: str, search_id: str, max_pages: int = 200
+    ) -> list[list[object]]:
+        """呼叫已部署的 saved-search RESTlet，逐頁抓取並組成 rows（header 列 + 資料列）。
 
-        if resp.status_code != 200:
-            raise NetSuiteError(
-                f"NetSuite RESTlet 回應錯誤（HTTP {resp.status_code}）：\n{resp.text[:1000]}"
-            )
-        try:
-            payload = resp.json()
-        except ValueError as exc:
-            raise NetSuiteError(f"NetSuite RESTlet 回應不是有效的 JSON：{resp.text[:1000]}") from exc
+        RESTlet 一次只回傳一頁（見 netsuite_restlet/saved_search_restlet.js），
+        讓每次呼叫都拿到全新的 governance 額度，避免資料量大的 saved search
+        在單次執行內抓完所有分頁而撞到 NetSuite 系統層級的執行單位上限
+        （這種系統層級中斷連 RESTlet 自己的 try/catch 都攔不到，呼叫端只會
+        看到籠統的 UNEXPECTED_ERROR）。
+        """
+        columns: list[object] | None = None
+        data_rows: list[list[object]] = []
+        page = 0
+        page_count = 1
 
-        if isinstance(payload, dict) and payload.get("error"):
-            raise NetSuiteError(
-                f"NetSuite saved search「{search_id}」執行失敗"
-                f"（{payload.get('name', 'UNKNOWN_ERROR')}）：{payload.get('message', '未知錯誤')}"
-            )
+        while page < page_count:
+            if page >= max_pages:
+                raise NetSuiteError(
+                    f"saved search「{search_id}」超過 {max_pages} 頁（每頁 500 列），"
+                    "資料量過大，請在 NetSuite 縮小這個 saved search 的篩選範圍。"
+                )
+            sep = "&" if "?" in restlet_url else "?"
+            url = f"{restlet_url}{sep}searchId={_pct(search_id)}&page={page}"
+            try:
+                resp = requests.get(
+                    url,
+                    headers={"Authorization": self._auth_header("GET", url)},
+                    timeout=120,
+                )
+            except requests.RequestException as exc:
+                raise NetSuiteError(f"連線 NetSuite 失敗：{exc}") from exc
 
-        rows = payload.get("rows") if isinstance(payload, dict) else None
-        if not rows:
+            if resp.status_code != 200:
+                raise NetSuiteError(
+                    f"NetSuite RESTlet 回應錯誤（HTTP {resp.status_code}）：\n{resp.text[:1000]}"
+                )
+            try:
+                payload = resp.json()
+            except ValueError as exc:
+                raise NetSuiteError(f"NetSuite RESTlet 回應不是有效的 JSON：{resp.text[:1000]}") from exc
+
+            if not isinstance(payload, dict):
+                raise NetSuiteError(f"NetSuite RESTlet 回應格式錯誤：{resp.text[:1000]}")
+            if payload.get("error"):
+                raise NetSuiteError(
+                    f"NetSuite saved search「{search_id}」執行失敗"
+                    f"（{payload.get('name', 'UNKNOWN_ERROR')}）：{payload.get('message', '未知錯誤')}"
+                )
+
+            if columns is None:
+                columns = payload.get("columns") or []
+            data_rows.extend(payload.get("rows") or [])
+            page_count = payload.get("pageCount") or 1
+            page += 1
+
+        if not columns or not data_rows:
             raise NetSuiteError(f"saved search「{search_id}」沒有回傳任何資料列。")
-        return rows
+        return [list(columns)] + data_rows
