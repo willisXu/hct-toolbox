@@ -17,11 +17,14 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
+import yaml
 
 from core import compare as compare_mod
 from core import inventory as inventory_mod
 from core import m00 as m00_mod
+from core import netsuite as netsuite_mod
 from core import shipping
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -135,8 +138,8 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
                 st.text(f"• {warning}")
 
 
-tab_order, tab_transfer, tab_compare, tab_inventory = st.tabs(
-    ["🛒 訂單轉換", "🔄 調撥單轉換", "🔍 表格核對", "📊 庫存核對"]
+tab_order, tab_transfer, tab_netsuite, tab_compare, tab_inventory = st.tabs(
+    ["🛒 訂單轉換", "🔄 調撥單轉換", "🔗 NetSuite 直接抓取", "🔍 表格核對", "📊 庫存核對"]
 )
 
 with tab_order:
@@ -154,6 +157,134 @@ with tab_transfer:
         "調撥單未出貨明細",
         "transfer",
     )
+
+# ------------------------------------------------------------ NetSuite 直接抓取
+
+
+def _load_saved_searches() -> list[dict]:
+    path = BASE_DIR / "mappings" / "netsuite_saved_searches.yaml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    except FileNotFoundError:
+        return []
+    return [item for item in data if item.get("search_id")]
+
+
+def _netsuite_client() -> tuple[netsuite_mod.NetSuiteClient, str]:
+    try:
+        cfg = st.secrets["netsuite"]
+    except Exception as exc:
+        raise ValueError(
+            "尚未設定 NetSuite 連線資訊。請依 .streamlit/secrets.toml.example，"
+            "在 Streamlit 的 Secrets 設定裡填入 netsuite 區塊。"
+        ) from exc
+    required = ("account_id", "consumer_key", "consumer_secret", "token_id", "token_secret", "restlet_url")
+    missing = [k for k in required if not cfg.get(k)]
+    if missing:
+        raise ValueError(f"NetSuite 設定缺少：{'、'.join(missing)}")
+    return netsuite_mod.NetSuiteClient(cfg), cfg["restlet_url"]
+
+
+with tab_netsuite:
+    st.subheader("Saved Search → 直接抓取轉換")
+    st.markdown(
+        "1. 選擇要抓取的 saved search，按「抓取資料」\n"
+        "2. 抓回後可在表格勾選要轉換的列（預設全選）\n"
+        "3. 選擇輸出格式，按「開始轉換」，完成後點「下載結果」"
+    )
+    searches = _load_saved_searches()
+    if not searches:
+        st.info("尚未設定 saved search，請編輯 mappings/netsuite_saved_searches.yaml 填入 search_id。")
+    else:
+        labels = [item["label"] for item in searches]
+        chosen_label = st.selectbox("選擇 saved search", labels, key="ns_search_select")
+        chosen = next(item for item in searches if item["label"] == chosen_label)
+
+        if st.button("📥 抓取資料", key="ns_fetch", type="primary"):
+            try:
+                with st.spinner("正在向 NetSuite 抓取資料..."):
+                    client, restlet_url = _netsuite_client()
+                    rows = client.run_saved_search(restlet_url, chosen["search_id"])
+            except Exception as exc:
+                st.session_state.pop("ns_rows", None)
+                st.session_state.pop("ns_result", None)
+                _show_error(exc)
+            else:
+                st.session_state["ns_rows"] = (rows, chosen["mode"], chosen_label)
+                st.session_state.pop("ns_result", None)
+
+        fetched = st.session_state.get("ns_rows")
+        if fetched:
+            ns_rows, ns_mode, ns_label = fetched
+            st.success(f"已抓取「{ns_label}」共 {len(ns_rows) - 1} 筆資料列。")
+
+            preview = pd.DataFrame(ns_rows[1:], columns=[str(c) for c in ns_rows[0]])
+            preview.insert(0, "選取", True)
+            edited = st.data_editor(
+                preview,
+                key="ns_editor",
+                use_container_width=True,
+                hide_index=True,
+                disabled=[c for c in preview.columns if c != "選取"],
+                column_config={"選取": st.column_config.CheckboxColumn("選取", default=True)},
+            )
+
+            st.markdown("**輸出格式**")
+            ns_format = st.radio(
+                "輸出格式",
+                [FORMAT_HCT, FORMAT_M00],
+                key="ns_format",
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+
+            if st.button("🚀 開始轉換", key="ns_run", type="primary"):
+                selected = edited[edited["選取"]].drop(columns=["選取"])
+                if selected.empty:
+                    st.warning("沒有勾選任何資料列。")
+                else:
+                    rows_for_convert = [list(ns_rows[0])] + selected.values.tolist()
+                    try:
+                        with st.spinner("轉換中..."):
+                            if ns_format == FORMAT_M00:
+                                result = m00_mod.convert_rows(rows_for_convert, ns_mode, M00_TEMPLATE_PATH)
+                            else:
+                                result = shipping.convert_rows(rows_for_convert, ns_mode, TEMPLATE_PATH)
+                    except Exception as exc:
+                        st.session_state.pop("ns_result", None)
+                        _show_error(exc)
+                    else:
+                        saved_path = _save_output(result.output_name, result.output_bytes)
+                        st.session_state["ns_result"] = (result, saved_path, ns_label)
+
+        stored = st.session_state.get("ns_result")
+        if stored:
+            result, saved_path, source_label = stored
+            is_m00 = hasattr(result, "order_count")
+            group_label = "訂單數" if is_m00 else "送貨單數"
+            group_count = result.order_count if is_m00 else result.shipments
+            st.success(
+                f"「{source_label}」轉換完成！{group_label} **{group_count}**、"
+                f"輸出品項 **{result.output_items}**、"
+                f"無法轉換明細 **{result.problem_count}**、警告 **{len(result.warnings)}**"
+            )
+            st.download_button(
+                f"⬇️ 下載結果（{result.output_name}）",
+                data=result.output_bytes,
+                file_name=result.output_name,
+                mime=EXCEL_MIME,
+                key="ns_download",
+            )
+            if saved_path:
+                st.caption(f"已同時存一份到：{saved_path}")
+            if result.problem_rows:
+                detail_hint = "（詳見輸出檔的「有問題訂單」工作表）" if not is_m00 else "（M00 格式輸出檔不含問題明細，僅顯示於下方）"
+                st.warning(f"有 {len(result.problem_rows)} 筆明細無法轉換{detail_hint}")
+                st.dataframe(result.problem_rows, use_container_width=True)
+            if result.warnings:
+                with st.expander(f"⚠️ 警告訊息（{len(result.warnings)} 則）"):
+                    for warning in result.warnings:
+                        st.text(f"• {warning}")
 
 # ------------------------------------------------------------ 表格核對
 

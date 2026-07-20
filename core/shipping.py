@@ -108,6 +108,11 @@ class ConvertError(ValueError):
 
 def convert(data: bytes, filename: str, mode: str, template_path: Path) -> ConvertResult:
     rows = first_sheet(read_workbook(data, filename))
+    return convert_rows(rows, mode, template_path)
+
+
+def convert_rows(rows: list[list[object]], mode: str, template_path: Path) -> ConvertResult:
+    """轉換已讀取的表格資料（header 列 + 資料列），供檔案上傳與 NetSuite 直接抓取共用。"""
     if not rows:
         raise ConvertError("來源工作表沒有可轉換的表格資料。")
 

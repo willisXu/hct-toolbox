@@ -14,3 +14,6 @@ outputs/
 
 # Claude Code
 .claude/
+
+# Streamlit 機密設定（NetSuite API 金鑰等，勿進版控）
+.streamlit/secrets.toml
