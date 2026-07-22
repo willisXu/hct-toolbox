@@ -30,16 +30,23 @@ MODE_TRANSFER = "transfer"  # 調撥單未出貨明細 (162)
 
 # 每個標準欄名可對應多個候選別名，依序取第一個存在的欄
 #（2026-07 NetSuite 報表改版：項目名稱→顯示名稱、備忘錄→備忘錄 (主要)）。
+_ARRIVAL_ALIASES = ("預計到貨日期", "預計到貨日", "DR_預計到貨日", "預計送達日期", "預計送達日")
+_ARRIVAL_SLOT_ALIASES = ("預計到貨時段", "DR_預計到貨時間", "預計到貨時間")
+
 _ALIASES = {
     MODE_ORDER: {
         "項目名稱": ("顯示名稱",),
         "序號/批號": ("交易序號/批號",),
         "DR_溫馨提醒": ("備忘錄", "備忘錄 (主要)"),
+        "DR_預計到貨日期": _ARRIVAL_ALIASES,
+        "DR_預計到貨時段": _ARRIVAL_SLOT_ALIASES,
     },
     MODE_TRANSFER: {
         "項目名稱": ("顯示名稱",),
         "序號/批號": ("交易序號/批號",),
         "DR_溫馨提醒": ("備忘錄", "備忘錄 (主要)"),
+        "DR_預計到貨日期": _ARRIVAL_ALIASES,
+        "DR_預計到貨時段": _ARRIVAL_SLOT_ALIASES,
         "出貨客戶": ("目標地點",),
         "門市/倉儲": ("倉儲",),
         "門市/倉儲聯繫人": ("倉儲聯繫人",),
@@ -171,6 +178,25 @@ def _apply_aliases(headers: dict[str, int], mode: str) -> None:
             if alias_key in headers:
                 headers[key] = headers[alias_key]
                 break
+    _match_arrival_by_keyword(headers)
+
+
+def _match_arrival_by_keyword(headers: dict[str, int]) -> None:
+    """到貨日／時段欄名在 saved search 常被改動，別名沒命中時退回關鍵字比對。"""
+    for canonical, keyword, excluded in (
+        ("DR_預計到貨日期", "到貨日", ("時段", "時間")),
+        ("DR_預計到貨時段", "到貨時", ()),
+    ):
+        key = canonical.casefold()
+        if key in headers:
+            continue
+        matched = next(
+            (index for header, index in list(headers.items())
+             if keyword in header and not any(word in header for word in excluded)),
+            None,
+        )
+        if matched is not None:
+            headers[key] = matched
 
 
 def _cell(row: list, headers: dict[str, int], name: str) -> object:
