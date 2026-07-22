@@ -23,16 +23,14 @@
 
 部署於 Streamlit Community Cloud，開啟網址即可使用（閒置後首次開啟需等待喚醒約 30 秒～1 分鐘）。
 
-## 本機執行
+結果檔一律用各分頁的「下載結果」按鈕取得，伺服器不留檔。
+
+## 本機開發
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## 打包成 exe（Windows）
-
-執行 `建置EXE.bat`，產物在 `release/` 資料夾。
 
 ## 專案結構
 

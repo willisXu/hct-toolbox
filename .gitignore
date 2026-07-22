@@ -2,14 +2,12 @@
 __pycache__/
 *.pyc
 
-# PyInstaller 建置產物（本機打包 exe 用，不需上雲）
+# 本機殘留的舊 exe 建置產物與輸出資料夾（桌面版已移除）
 build/
 dist/
 build_venv/
 release/
 build_log.txt
-
-# 執行時輸出
 outputs/
 
 # Claude Code

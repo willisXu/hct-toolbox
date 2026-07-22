@@ -32,11 +32,6 @@ from core import shipping
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "mappings" / "HCT範本.xlsx"
 M00_TEMPLATE_PATH = BASE_DIR / "mappings" / "M00出貨格式.xlsx"
-OUTPUT_DIR = BASE_DIR / "outputs"
-
-# Streamlit Community Cloud 會把 repo 掛在 /mount/src；雲端磁碟是暫存的，
-# 存進 outputs 也拿不到，所以只在本機執行時落地存檔並顯示路徑。
-IS_LOCAL = not str(BASE_DIR).startswith("/mount/src")
 
 FORMAT_HCT = "HCT 銷貨報表格式"
 FORMAT_M00 = "M00 出貨格式"
@@ -47,15 +42,6 @@ st.set_page_config(page_title="HCT 工具箱", page_icon="📦", layout="wide")
 
 st.title("📦 HCT 工具箱")
 st.caption("訂單轉換 / 調撥單轉換 / 表格核對 / 退貨核對 / 庫存核對 — 上傳檔案 → 按按鈕 → 下載結果")
-
-
-def _save_output(name: str, data: bytes) -> str:
-    if not IS_LOCAL:
-        return ""
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    path = OUTPUT_DIR / name
-    path.write_bytes(data)
-    return str(path)
 
 
 def _show_error(exc: Exception) -> None:
@@ -105,13 +91,12 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
             st.session_state.pop(state_key, None)
             _show_error(exc)
         else:
-            saved_path = _save_output(result.output_name, result.output_bytes)
-            st.session_state[state_key] = (result, saved_path, uploaded.name)
+            st.session_state[state_key] = (result, uploaded.name)
 
     stored = st.session_state.get(state_key)
     if not stored:
         return
-    result, saved_path, source_name = stored
+    result, source_name = stored
     is_m00 = hasattr(result, "order_count")
     group_label = "訂單數" if is_m00 else "送貨單數"
     group_count = result.order_count if is_m00 else result.shipments
@@ -127,8 +112,6 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
         mime=EXCEL_MIME,
         key=f"{key_prefix}_download",
     )
-    if saved_path:
-        st.caption(f"已同時存一份到：{saved_path}")
 
     if result.problem_rows:
         detail_hint = "（詳見輸出檔的「有問題訂單」工作表）" if not is_m00 else "（M00 格式輸出檔不含問題明細，僅顯示於下方）"
@@ -287,12 +270,11 @@ with tab_netsuite:
                         st.session_state.pop("ns_result", None)
                         _show_error(exc)
                     else:
-                        saved_path = _save_output(result.output_name, result.output_bytes)
-                        st.session_state["ns_result"] = (result, saved_path, ns_label)
+                        st.session_state["ns_result"] = (result, ns_label)
 
         stored = st.session_state.get("ns_result")
         if stored:
-            result, saved_path, source_label = stored
+            result, source_label = stored
             is_m00 = hasattr(result, "order_count")
             group_label = "訂單數" if is_m00 else "送貨單數"
             group_count = result.order_count if is_m00 else result.shipments
@@ -308,8 +290,6 @@ with tab_netsuite:
                 mime=EXCEL_MIME,
                 key="ns_download",
             )
-            if saved_path:
-                st.caption(f"已同時存一份到：{saved_path}")
             if result.problem_rows:
                 detail_hint = "（詳見輸出檔的「有問題訂單」工作表）" if not is_m00 else "（M00 格式輸出檔不含問題明細，僅顯示於下方）"
                 st.warning(f"有 {len(result.problem_rows)} 筆明細無法轉換{detail_hint}")
@@ -345,12 +325,10 @@ with tab_compare:
                 st.session_state.pop("cmp_result", None)
                 _show_error(exc)
             else:
-                saved_path = _save_output(result.output_name, result.output_bytes)
-                st.session_state["cmp_result"] = (result, saved_path)
+                st.session_state["cmp_result"] = result
 
-    stored = st.session_state.get("cmp_result")
-    if stored:
-        result, saved_path = stored
+    result = st.session_state.get("cmp_result")
+    if result:
         st.success(
             f"核對完成！數量核對 **{result.quantity_rows}** 筆、"
             f"訂單編號核對 **{result.order_rows}** 筆"
@@ -368,8 +346,6 @@ with tab_compare:
             mime=EXCEL_MIME,
             key="cmp_download",
         )
-        if saved_path:
-            st.caption(f"已同時存一份到：{saved_path}")
 
 # ------------------------------------------------------------ 退貨核對
 
@@ -398,12 +374,10 @@ with tab_return:
                 st.session_state.pop("ret_result", None)
                 _show_error(exc)
             else:
-                saved_path = _save_output(result.output_name, result.output_bytes)
-                st.session_state["ret_result"] = (result, saved_path)
+                st.session_state["ret_result"] = result
 
-    stored = st.session_state.get("ret_result")
-    if stored:
-        result, saved_path = stored
+    result = st.session_state.get("ret_result")
+    if result:
         st.success(f"核對完成！共 **{result.total_rows}** 筆料號＋效期組合。")
         metric_cols = st.columns(4)
         for idx, status in enumerate(["一致", "數量不符", "僅退貨授權", "僅入庫記錄"]):
@@ -415,8 +389,6 @@ with tab_return:
             mime=EXCEL_MIME,
             key="ret_download",
         )
-        if saved_path:
-            st.caption(f"已同時存一份到：{saved_path}")
 
 # ------------------------------------------------------------ 庫存核對
 
@@ -446,12 +418,10 @@ with tab_inventory:
                 st.session_state.pop("inv_result", None)
                 _show_error(exc)
             else:
-                saved_path = _save_output(result.output_name, result.output_bytes)
-                st.session_state["inv_result"] = (result, saved_path)
+                st.session_state["inv_result"] = result
 
-    stored = st.session_state.get("inv_result")
-    if stored:
-        result, saved_path = stored
+    result = st.session_state.get("inv_result")
+    if result:
         st.success(
             f"核對完成！日期明細 **{len(result.detail_rows)}** 筆、"
             f"料號彙總 **{len(result.item_rows)}** 筆、"
@@ -467,9 +437,6 @@ with tab_inventory:
             mime=EXCEL_MIME,
             key="inv_download",
         )
-        if saved_path:
-            st.caption(f"已同時存一份到：{saved_path}")
 
 st.divider()
-_footer_note = "結果檔會同步存放在 outputs 資料夾" if IS_LOCAL else "請用「下載結果」按鈕保存檔案"
-st.caption(f"HCT 工具箱 v1.1 ｜ {_footer_note} ｜ {datetime.now():%Y-%m-%d}")
+st.caption(f"HCT 工具箱 v1.1 ｜ 請用「下載結果」按鈕保存檔案 ｜ {datetime.now():%Y-%m-%d}")
