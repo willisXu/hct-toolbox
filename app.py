@@ -202,6 +202,10 @@ with tab_netsuite:
                     st.session_state.pop("ns_rows", None)
                     st.info(f"「{chosen_label}」目前沒有符合條件的資料。")
                 else:
+                    # 每次抓取遞增序號並併入 widget key：若只靠標籤+列數，
+                    # 「重抓後列數剛好相同」會沿用上一批資料的勾選狀態，
+                    # 悄悄把舊的取消勾選套到內容不同的新資料列上。
+                    st.session_state["ns_fetch_seq"] = st.session_state.get("ns_fetch_seq", 0) + 1
                     st.session_state["ns_rows"] = (rows, chosen["mode"], chosen_label)
 
         fetched = st.session_state.get("ns_rows")
@@ -213,8 +217,9 @@ with tab_netsuite:
             # 每次按下都會讓 nonce +1、換一組新的 data_editor key，強制
             # Streamlit 重建 widget、整批套用新的勾選狀態（即使兩次都按
             # 同一個按鈕，也要蓋掉使用者中途手動勾/取消的個別列）。
-            default_key = f"ns_select_default_{ns_label}_{len(ns_rows)}"
-            nonce_key = f"ns_select_nonce_{ns_label}_{len(ns_rows)}"
+            fetch_seq = st.session_state.get("ns_fetch_seq", 0)
+            default_key = f"ns_select_default_{ns_label}_{fetch_seq}_{len(ns_rows)}"
+            nonce_key = f"ns_select_nonce_{ns_label}_{fetch_seq}_{len(ns_rows)}"
             if default_key not in st.session_state:
                 st.session_state[default_key] = True
                 st.session_state[nonce_key] = 0
@@ -231,7 +236,7 @@ with tab_netsuite:
 
             preview = pd.DataFrame(ns_rows[1:], columns=[str(c) for c in ns_rows[0]])
             preview.insert(0, "選取", st.session_state[default_key])
-            editor_key = f"ns_editor_{ns_label}_{len(ns_rows)}_{st.session_state[nonce_key]}"
+            editor_key = f"ns_editor_{ns_label}_{fetch_seq}_{len(ns_rows)}_{st.session_state[nonce_key]}"
             edited = st.data_editor(
                 preview,
                 # key 隨資料集、以及「全選/取消全選」的 nonce 變化，兩者任一

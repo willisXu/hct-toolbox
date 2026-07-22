@@ -23,6 +23,7 @@ from core.return_compare import _normalize_expiry as ret_normalize_expiry, _stri
 from core.shipping import (
     MODE_ORDER,
     _match_arrival_by_keyword,
+    _normalize_arrival,
     _normalize_expiry as ship_normalize_expiry,
     _split_phone,
     _split_postal,
@@ -128,6 +129,15 @@ def test_arrival_keyword_excludes_actual_and_warns():
     notes = _match_arrival_by_keyword(headers)
     assert headers["dr_預計到貨日期"] == 1
     assert notes and "客戶指定到貨日" in notes[0]
+
+
+def test_arrival_blank_warning_mentions_merge_only_in_order_mode():
+    # 訂單模式（真的有跨單合併）才提「不跨單合併」；M00/調撥單用中性訊息
+    _, order_warning = _normalize_arrival(None, merge_hint=True)
+    _, neutral_warning = _normalize_arrival(None)
+    assert "不跨單合併" in order_warning
+    assert "不跨單合併" not in neutral_warning
+    assert "空白" in neutral_warning
 
 
 def test_arrival_keyword_no_match_when_only_excluded():

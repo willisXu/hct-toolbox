@@ -221,10 +221,14 @@ def _normalize_date_key(value: object) -> str:
     return parsed.strftime("%Y-%m-%d") if parsed else ""
 
 
-def _normalize_arrival(value: object) -> tuple[object, str]:
+def _normalize_arrival(value: object, merge_hint: bool = False) -> tuple[object, str]:
+    """merge_hint 只有訂單模式（真的有跨單合併邏輯）才傳 True；
+    M00 與調撥單模式不合併，空白警告不該暗示「填了就會合併」。"""
     raw = normalize_text(value)
     if not raw:
-        return None, "預計到貨日期空白；此 SO 不跨單合併。"
+        if merge_hint:
+            return None, "預計到貨日期空白；此 SO 不跨單合併。"
+        return None, "預計到貨日期空白。"
     parsed = try_parse_date(value)
     if parsed:
         return parsed, ""
@@ -393,7 +397,8 @@ def _build_shipments(rows: list, headers: dict[str, int], mode: str) -> dict:
         shipment = shipments.get(shipment_key)
         if shipment is None:
             arrival_value, arrival_warning = _normalize_arrival(
-                _cell(row, headers, "DR_預計到貨日期")
+                _cell(row, headers, "DR_預計到貨日期"),
+                merge_hint=mode == MODE_ORDER,
             )
             shipment = Shipment(
                 merged=is_merged,
