@@ -46,4 +46,5 @@ core/
   netsuite.py       # NetSuite REST OAuth 1.0 (TBA) 客戶端，呼叫 saved search RESTlet
 netsuite_restlet/   # 需部署到 NetSuite 的 SuiteScript RESTlet + 部署說明
 mappings/           # 輸出範本（HCT範本.xlsx、M00出貨格式.xlsx）、saved search 對照表
+tests/              # 回歸測試（python tests/test_core.py，免安裝 pytest）
 ```

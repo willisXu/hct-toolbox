@@ -19,7 +19,14 @@ import io
 from dataclasses import dataclass
 from datetime import datetime
 
-from .xlio import normalize_number, normalize_text, read_workbook, try_parse_date, first_sheet
+from .xlio import (
+    build_header_map,
+    first_sheet,
+    normalize_number,
+    normalize_text,
+    read_workbook,
+    try_parse_date,
+)
 
 SOURCE_RA = "RETURN_AUTH"
 SOURCE_HCT = "HCT_RECEIVE"
@@ -51,8 +58,8 @@ class ReturnCompareResult:
 def compare(data1: bytes, name1: str, data2: bytes, name2: str) -> ReturnCompareResult:
     rows1 = first_sheet(read_workbook(data1, name1))
     rows2 = first_sheet(read_workbook(data2, name2))
-    headers1 = _build_header_map(rows1[0]) if rows1 else {}
-    headers2 = _build_header_map(rows2[0]) if rows2 else {}
+    headers1 = build_header_map(rows1[0]) if rows1 else {}
+    headers2 = build_header_map(rows2[0]) if rows2 else {}
 
     type1 = _detect_type(headers1)
     type2 = _detect_type(headers2)
@@ -82,15 +89,6 @@ def compare(data1: bytes, name1: str, data2: bytes, name2: str) -> ReturnCompare
 
 
 # ------------------------------------------------------------------ 讀表輔助
-
-
-def _build_header_map(header_row: list) -> dict[str, int]:
-    headers: dict[str, int] = {}
-    for index, value in enumerate(header_row):
-        text = normalize_text(value)
-        if text and text.casefold() not in headers:
-            headers[text.casefold()] = index
-    return headers
 
 
 def _cell(rows: list, row_index: int, headers: dict, name: str) -> object:
@@ -139,7 +137,12 @@ def _strip_dr_prefix(text: str) -> str:
 
 
 def _normalize_expiry(value: object) -> tuple[str, str]:
-    """回傳 (比對用 key, 顯示用文字)；無法辨識為日期時 key 留空、顯示原始文字。"""
+    """回傳 (比對用 key, 顯示用文字)。
+
+    無法辨識為日期時，key 保留原始文字（casefold，加 raw: 前綴與日期 key
+    區隔）：兩邊文字相同仍可對上，但不同批號不會被誤併成同一筆；
+    只有真正空白的效期才用空字串 key。
+    """
     text = normalize_text(value)
     if not text:
         return "", ""
@@ -147,7 +150,7 @@ def _normalize_expiry(value: object) -> tuple[str, str]:
     if parsed:
         display = parsed.strftime("%Y-%m-%d")
         return display, display
-    return "", text
+    return f"raw:{text.casefold()}", text
 
 
 # ------------------------------------------------------------------ 核對

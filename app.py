@@ -195,8 +195,14 @@ with tab_netsuite:
                 st.session_state.pop("ns_result", None)
                 _show_error(exc)
             else:
-                st.session_state["ns_rows"] = (rows, chosen["mode"], chosen_label)
                 st.session_state.pop("ns_result", None)
+                if len(rows) <= 1:
+                    # 只有 header 列：saved search 沒有符合條件的結果，是正常
+                    # 業務狀態（例如當天訂單都已出貨），不是錯誤。
+                    st.session_state.pop("ns_rows", None)
+                    st.info(f"「{chosen_label}」目前沒有符合條件的資料。")
+                else:
+                    st.session_state["ns_rows"] = (rows, chosen["mode"], chosen_label)
 
         fetched = st.session_state.get("ns_rows")
         if fetched:

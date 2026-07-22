@@ -27,7 +27,6 @@ from .shipping import (
     _add_distinct,
     _apply_aliases,
     _batch_status_warning,
-    _build_header_map,
     _cell,
     _material_and_name,
     _normalize_arrival,
@@ -36,7 +35,7 @@ from .shipping import (
     _positive_quantity,
     _split_postal,
 )
-from .xlio import first_sheet, is_blank_row, normalize_text, read_workbook
+from .xlio import build_header_map, first_sheet, is_blank_row, normalize_text, read_workbook
 
 FIXED_PRODUCT_STATUS = "良品"
 FIXED_SHIP_METHOD = "件出"
@@ -95,13 +94,14 @@ def convert_rows(rows: list[list[object]], mode: str, template_path: Path) -> M0
     if not rows:
         raise M00Error("來源工作表沒有可轉換的表格資料。")
 
-    headers = _build_header_map(rows[0])
-    _apply_aliases(headers, mode)
+    headers = build_header_map(rows[0])
+    alias_notes = _apply_aliases(headers, mode)
     missing = [h for h in _REQUIRED_HEADERS[mode] if h.casefold() not in headers]
     if missing:
         raise M00Error("來源檔缺少必要欄位：\n" + "\n".join(f"- {h}" for h in missing))
 
     state = _build_groups(rows, headers, mode)
+    state["warnings"] = alias_notes + state["warnings"]
     total_items = sum(len(g.items) for g in state["groups"].values())
     if total_items == 0:
         raise M00Error("沒有可輸出的有效品項。")
@@ -166,7 +166,14 @@ def _build_groups(rows: list, headers: dict, mode: str) -> dict:
                 _add_distinct(warnings, arrival_warning)
             groups[sales_order] = group
 
-        _add_distinct(group.times, normalize_text(_cell(row, headers, "DR_預計到貨時段")))
+        slot_text = normalize_text(_cell(row, headers, "DR_預計到貨時段"))
+        _add_distinct(group.times, slot_text)
+        if slot_text and slot_text not in _TIME_SLOT_MAP:
+            _add_distinct(
+                warnings,
+                f"預計到貨時段「{slot_text}」無法對應（早(9-12)/中(12-17)/晚(17-20)），"
+                f"將以預設「{_DEFAULT_TIME_SLOT}」輸出希望配送時段。",
+            )
         _add_distinct(group.reminders, normalize_text(_cell(row, headers, "DR_溫馨提醒")))
 
         batch_value = normalize_text(_cell(row, headers, "序號/批號"))

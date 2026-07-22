@@ -141,10 +141,17 @@ class NetSuiteClient:
                     f"（{payload.get('name', 'UNKNOWN_ERROR')}）：{payload.get('message', '未知錯誤')}"
                 )
 
-            if columns is None:
-                columns = payload.get("columns") or []
+            if columns is None and payload.get("columns"):
+                columns = list(payload["columns"])
             data_rows.extend(payload.get("rows") or [])
-            page_count = payload.get("pageCount") or 1
+            # pageCount 為 0 是合法值（saved search 沒有符合條件的結果時
+            # pageRanges 是空陣列），不能用 `or 1` 把 0 蓋成 1。
+            raw_page_count = payload.get("pageCount")
+            page_count = (
+                int(raw_page_count)
+                if isinstance(raw_page_count, (int, float)) and not isinstance(raw_page_count, bool)
+                else 1
+            )
             if expected_page_count is None:
                 expected_page_count = page_count
             elif page_count != expected_page_count:
@@ -154,6 +161,11 @@ class NetSuiteClient:
                 )
             page += 1
 
-        if not columns or not data_rows:
-            raise NetSuiteError(f"saved search「{search_id}」沒有回傳任何資料列。")
+        if not columns:
+            raise NetSuiteError(
+                f"saved search「{search_id}」沒有回傳任何欄位定義，"
+                "請確認 RESTlet 部署與 searchId 是否正確。"
+            )
+        # data_rows 可以是空的：saved search 沒有符合條件的結果是正常業務
+        # 狀態（例如當天訂單都已出貨），由呼叫端顯示「沒有資料」提示。
         return _normalize_headers([list(columns)] + data_rows)

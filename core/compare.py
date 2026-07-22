@@ -12,7 +12,7 @@ import io
 from dataclasses import dataclass
 from datetime import datetime
 
-from .xlio import first_sheet, is_excel_error_text, normalize_number, read_workbook
+from .xlio import build_header_map, first_sheet, is_excel_error_text, normalize_number, read_workbook
 
 SOURCE_UNSHIPPED = "UNSHIPPED"
 SOURCE_DELIVERY = "DELIVERY"
@@ -50,8 +50,8 @@ def compare(
 ) -> CompareResult:
     rows1 = first_sheet(read_workbook(data1, name1))
     rows2 = first_sheet(read_workbook(data2, name2))
-    headers1 = _build_header_map(rows1[0]) if rows1 else {}
-    headers2 = _build_header_map(rows2[0]) if rows2 else {}
+    headers1 = build_header_map(rows1[0]) if rows1 else {}
+    headers2 = build_header_map(rows2[0]) if rows2 else {}
 
     type1 = _detect_type(headers1)
     type2 = _detect_type(headers2)
@@ -115,15 +115,6 @@ def _normalize_order_id(value: object) -> str:
     elif dash == 0:
         text = ""
     return text
-
-
-def _build_header_map(header_row: list) -> dict[str, int]:
-    headers: dict[str, int] = {}
-    for index, value in enumerate(header_row):
-        text = _normalize_text(value)
-        if text and text.casefold() not in headers:
-            headers[text.casefold()] = index
-    return headers
 
 
 def _cell(rows: list, row_index: int, headers: dict, name: str) -> object:
@@ -204,7 +195,7 @@ def _build_quantity_compare(unshipped, un_headers, delivery, de_headers) -> list
 def _build_order_compare(unshipped, un_headers, delivery, de_headers) -> list[dict]:
     records: dict[str, dict] = {}
 
-    def accumulate(rows, headers, order_h, customer_h, qty_h, prefix):
+    def accumulate(rows, headers, order_h, customer_h, qty_h, prefix, qty_field):
         for row_index in range(1, len(rows)):
             original = _normalize_text(_cell(rows, row_index, headers, order_h))
             order_id = _normalize_order_id(original)
@@ -219,17 +210,17 @@ def _build_order_compare(unshipped, un_headers, delivery, de_headers) -> list[di
             })
             customer = _normalize_customer(_cell(rows, row_index, headers, customer_h))
             quantity = normalize_number(_cell(rows, row_index, headers, qty_h))
-            originals = record[f"{prefix}原始編號" if prefix == "銷貨單" else "未出貨原始編號"]
+            originals = record[f"{prefix}原始編號"]
             if original and original not in originals:
                 originals.append(original)
             customers = record[f"{prefix}客戶"]
             if customer and customer not in customers:
                 customers.append(customer)
             record[f"{prefix}筆數"] += 1
-            record["銷貨數量" if prefix == "銷貨單" else "未出貨數量"] += quantity
+            record[qty_field] += quantity
 
-    accumulate(unshipped, un_headers, "客戶採購單編號", "出貨客戶", "出貨數量", "未出貨")
-    accumulate(delivery, de_headers, "網路訂單編號", "客戶簡稱", "銷貨數量", "銷貨單")
+    accumulate(unshipped, un_headers, "客戶採購單編號", "出貨客戶", "出貨數量", "未出貨", "未出貨數量")
+    accumulate(delivery, de_headers, "網路訂單編號", "客戶簡稱", "銷貨數量", "銷貨單", "銷貨數量")
 
     result = []
     for record in records.values():

@@ -18,6 +18,9 @@ SSNS = "{urn:schemas-microsoft-com:office:spreadsheet}"
 
 def read_workbook(data: bytes, filename: str = "") -> dict[str, list[list[object]]]:
     """讀取 Excel 檔案內容，回傳 {sheet_name: rows}。"""
+    if data[:3] == b"\xef\xbb\xbf":
+        # UTF-8 BOM 會讓 XML 判斷失敗（ET.fromstring 也不接受 bytes 前的 BOM）
+        data = data[3:]
     head = data[:512].lstrip()
     if head.startswith(b"<?xml") or head.startswith(b"<Workbook"):
         return _read_spreadsheetml(data, filename)
@@ -151,6 +154,16 @@ _EXCEL_ERROR_VALUES = {
 def is_excel_error_text(value: object) -> bool:
     """判斷是否為 Excel 公式錯誤值的文字表示（VBA 端用 IsError 偵測）。"""
     return isinstance(value, str) and value.strip().upper() in _EXCEL_ERROR_VALUES
+
+
+def build_header_map(header_row: list) -> dict[str, int]:
+    """欄名（casefold）→ 欄索引；同名欄取第一個。各模組共用，避免各自維護。"""
+    headers: dict[str, int] = {}
+    for index, value in enumerate(header_row):
+        text = normalize_text(value)
+        if text and text.casefold() not in headers:
+            headers[text.casefold()] = index
+    return headers
 
 
 def is_blank_row(row: list) -> bool:

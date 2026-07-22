@@ -13,7 +13,7 @@ import io
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-from .xlio import read_workbook
+from .xlio import is_excel_error_text, read_workbook, try_parse_date
 
 SYSTEM_HCT = "HCT"
 SYSTEM_NETSUITE = "NetSuite"
@@ -79,12 +79,16 @@ def _normalize_header(value: object) -> str:
 
 
 def _normalize_item(value: object) -> str:
+    if is_excel_error_text(value):
+        return ""
     if isinstance(value, float) and value == int(value):
         return str(int(value))
     return "" if value is None else str(value).strip()
 
 
 def _normalize_location(value: object) -> str:
+    if is_excel_error_text(value):
+        return ""
     text = ("" if value is None else str(value)).strip().upper()
     if "_" in text:
         text = text.split("_", 1)[0]
@@ -92,39 +96,17 @@ def _normalize_location(value: object) -> str:
 
 
 def _normalize_date(value: object) -> tuple[str, bool]:
-    """回傳 (yyyymmdd 或空字串, 是否有效)。空值視為有效的「無到期日」。"""
-    if value is None:
+    """回傳 (yyyymmdd 或空字串, 是否有效)。空值視為有效的「無到期日」。
+
+    日期解析交給 xlio.try_parse_date（datetime、Excel 序號、數字型別的
+    YYYYMMDD、各種文字格式都涵蓋），避免自行維護一份分歧的解析邏輯。
+    """
+    if value is None or str(value).strip() == "":
         return "", True
-    if isinstance(value, datetime):
-        return value.strftime("%Y%m%d"), True
-    if isinstance(value, date):
-        return value.strftime("%Y%m%d"), True
-    text = str(value).strip()
-    if not text:
-        return "", True
-    if "T" in text:
-        text = text.split("T", 1)[0]
-    try:
-        if len(text) == 8 and text.isdigit():
-            parsed = date(int(text[:4]), int(text[4:6]), int(text[6:]))
-        elif "/" in text:
-            parts = text.split("/")
-            if len(parts) != 3:
-                return "", False
-            parsed = date(int(parts[0]), int(parts[1]), int(parts[2]))
-        elif "-" in text:
-            parts = text.split("-")
-            if len(parts) != 3:
-                return "", False
-            parsed = date(int(parts[0]), int(parts[1]), int(parts[2]))
-        elif isinstance(value, (int, float)) and 0 < float(value) < 100000:
-            from datetime import timedelta
-            parsed = (datetime(1899, 12, 30) + timedelta(days=float(value))).date()
-        else:
-            return "", False
-    except (ValueError, OverflowError):
-        return "", False
-    return parsed.strftime("%Y%m%d"), True
+    parsed = try_parse_date(value)
+    if parsed:
+        return parsed.strftime("%Y%m%d"), True
+    return "", False
 
 
 def _normalize_quantity(value: object) -> tuple[float, bool]:
@@ -321,17 +303,22 @@ def _add_aggregate(aggregate: dict, key: tuple, available: float, total: float,
 # ------------------------------------------------------------------ 核對
 
 
+def _qty_equal(a: float, b: float) -> bool:
+    """數量比較用容差，避免多筆小數加總的浮點誤差被誤判為差異（同 compare.py）。"""
+    return abs(a - b) < 1e-6
+
+
 def _classify(has_hct: bool, has_ns: bool, hct_avail: float, hct_total: float,
               ns_avail: float, ns_total: float) -> tuple[str, str]:
     if not has_ns:
         return STATUS_HCT_ONLY, "HCT 有庫存資料，NetSuite 未找到對應資料"
     if not has_hct:
         return STATUS_NS_ONLY, "NetSuite 有庫存資料，HCT 未找到對應資料"
-    if hct_avail == ns_avail and hct_total == ns_total:
+    if _qty_equal(hct_avail, ns_avail) and _qty_equal(hct_total, ns_total):
         return STATUS_MATCH, "HCT 與 NetSuite 可用量及總庫存量一致"
-    if hct_total == ns_total:
+    if _qty_equal(hct_total, ns_total):
         return STATUS_AVAILABLE_DIFF, "帳面總量一致，但可出／可用狀態不同"
-    if hct_avail == ns_avail:
+    if _qty_equal(hct_avail, ns_avail):
         return STATUS_TOTAL_DIFF, "可用量一致，但帳面總量不同"
     return STATUS_BOTH_DIFF, "可用量與總庫存量皆有差異"
 

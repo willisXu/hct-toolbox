@@ -16,7 +16,14 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
-from .xlio import first_sheet, is_blank_row, normalize_text, read_workbook, try_parse_date
+from .xlio import (
+    build_header_map,
+    first_sheet,
+    is_blank_row,
+    normalize_text,
+    read_workbook,
+    try_parse_date,
+)
 
 GENERAL_ORDER_TYPE = "一般銷售訂單"
 PLATFORM_NAME = "DR.WU 達爾膚生醫科技股份有限公司"
@@ -76,14 +83,11 @@ _REQUIRED_HEADERS = {
 class Shipment:
     merged: bool
     arrival_value: object          # date / str / None
-    arrival_key: str
     customer: str
     location: str
     contact: str
     phone: str
     address: str
-    input_rows: int = 0
-    total_quantity: float = 0.0
     items: dict = field(default_factory=dict)          # key -> item dict（保序）
     documents: list = field(default_factory=list)
     sales_orders: list = field(default_factory=list)
@@ -123,13 +127,14 @@ def convert_rows(rows: list[list[object]], mode: str, template_path: Path) -> Co
     if not rows:
         raise ConvertError("來源工作表沒有可轉換的表格資料。")
 
-    headers = _build_header_map(rows[0])
-    _apply_aliases(headers, mode)
+    headers = build_header_map(rows[0])
+    alias_notes = _apply_aliases(headers, mode)
     missing = [h for h in _REQUIRED_HEADERS[mode] if h.casefold() not in headers]
     if missing:
         raise ConvertError("來源檔缺少必要欄位：\n" + "\n".join(f"- {h}" for h in missing))
 
     state = _build_shipments(rows, headers, mode)
+    state["warnings"] = alias_notes + state["warnings"]
     total_items = sum(len(s.items) for s in state["shipments"].values())
     if total_items == 0:
         raise ConvertError("沒有可輸出的有效品項。")
@@ -159,16 +164,8 @@ def convert_rows(rows: list[list[object]], mode: str, template_path: Path) -> Co
 # ------------------------------------------------------------------ 讀表輔助
 
 
-def _build_header_map(header_row: list) -> dict[str, int]:
-    headers: dict[str, int] = {}
-    for index, value in enumerate(header_row):
-        text = normalize_text(value)
-        if text and text.casefold() not in headers:
-            headers[text.casefold()] = index
-    return headers
-
-
-def _apply_aliases(headers: dict[str, int], mode: str) -> None:
+def _apply_aliases(headers: dict[str, int], mode: str) -> list[str]:
+    """套用別名對照；回傳關鍵字比對備援產生的提醒訊息（給呼叫端併入警告）。"""
     for canonical, aliases in _ALIASES[mode].items():
         key = canonical.casefold()
         if key in headers:
@@ -178,25 +175,33 @@ def _apply_aliases(headers: dict[str, int], mode: str) -> None:
             if alias_key in headers:
                 headers[key] = headers[alias_key]
                 break
-    _match_arrival_by_keyword(headers)
+    return _match_arrival_by_keyword(headers)
 
 
-def _match_arrival_by_keyword(headers: dict[str, int]) -> None:
+# 關鍵字比對備援要排除語意不同的欄位（實際到貨日、上次到貨日等），
+# 避免誤綁後整批指定送達日都用錯欄位。
+_ARRIVAL_EXCLUDED_WORDS = ("實際", "上次", "歷史")
+
+
+def _match_arrival_by_keyword(headers: dict[str, int]) -> list[str]:
     """到貨日／時段欄名在 saved search 常被改動，別名沒命中時退回關鍵字比對。"""
+    notes: list[str] = []
     for canonical, keyword, excluded in (
-        ("DR_預計到貨日期", "到貨日", ("時段", "時間")),
-        ("DR_預計到貨時段", "到貨時", ()),
+        ("DR_預計到貨日期", "到貨日", ("時段", "時間") + _ARRIVAL_EXCLUDED_WORDS),
+        ("DR_預計到貨時段", "到貨時", _ARRIVAL_EXCLUDED_WORDS),
     ):
         key = canonical.casefold()
         if key in headers:
             continue
-        matched = next(
-            (index for header, index in list(headers.items())
-             if keyword in header and not any(word in header for word in excluded)),
-            None,
-        )
-        if matched is not None:
-            headers[key] = matched
+        for header, index in list(headers.items()):
+            if keyword in header and not any(word in header for word in excluded):
+                headers[key] = index
+                notes.append(
+                    f"找不到「{canonical}」欄，改用關鍵字比對到的來源欄「{header}」，"
+                    "請確認來源報表欄位是否正確。"
+                )
+                break
+    return notes
 
 
 def _cell(row: list, headers: dict[str, int], name: str) -> object:
@@ -227,13 +232,17 @@ def _normalize_arrival(value: object) -> tuple[object, str]:
 
 
 def _normalize_expiry(batch_text: str) -> tuple[str, object, str]:
-    """回傳 (expiry_key, expiry_value, warning)。批號本身即效期字串。"""
+    """回傳 (expiry_key, expiry_value, warning)。批號本身即效期字串。
+
+    解析失敗時 key 保留原始批號文字（加 raw: 前綴與日期 key 區隔），
+    避免同料號下兩個都無法解析的「不同」批號被靜默合併成同一筆。
+    """
     if not batch_text:
         return "", None, ""
     parsed = try_parse_date(batch_text)
     if parsed:
         return parsed.strftime("%Y-%m-%d"), parsed, ""
-    return "", None, f"效期無法辨識，已留白：{batch_text}"
+    return f"raw:{batch_text.casefold()}", None, f"效期無法辨識，已留白：{batch_text}"
 
 
 # 「項目」欄的「料號直接連品名」樣態（2026-07 備品列新增）：開頭一串數字
@@ -389,7 +398,6 @@ def _build_shipments(rows: list, headers: dict[str, int], mode: str) -> dict:
             shipment = Shipment(
                 merged=is_merged,
                 arrival_value=arrival_value,
-                arrival_key=key[0],
                 customer=key[1],
                 location=key[2],
                 contact=normalize_text(_cell(row, headers, "門市/倉儲聯繫人")),
@@ -432,7 +440,6 @@ def _add_row_to_shipment(
     mode: str,
 ) -> int:
     """把一列加進送貨單；回傳跳過列數 (0 或 1)。"""
-    shipment.input_rows += 1
     _add_distinct(shipment.documents, document)
     _add_distinct(shipment.sales_orders, sales_order)
 
@@ -507,7 +514,6 @@ def _add_row_to_shipment(
             "expiry_key": expiry_key,
             "quantity": quantity,
         }
-    shipment.total_quantity += quantity
     return 0
 
 
