@@ -16,6 +16,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+from core import bundle_split
 from core.compare import _normalize_customer, _normalize_order_id
 from core.inventory import _normalize_date, _normalize_item, _normalize_location, _qty_equal
 from core.m00 import convert_rows as m00_convert_rows
@@ -204,6 +205,133 @@ def test_e2e_unknown_time_slot_warns():
     rows = [_E2E_HEADER, _e2e_row("2027-05-01", 10, slot="晚（17-20）")]
     m00_result = m00_convert_rows(rows, MODE_ORDER, M00_TEMPLATE_PATH)
     assert any("無法對應" in w for w in m00_result.warnings)
+
+
+# ------------------------------------------------------------------ ED 訂單拆解
+
+_SPLIT_HEADER = ["單號", "商品貨號", "商品名稱", "商品類型", "數量", "結帳單價", "含稅金額"]
+
+
+def _split_map():
+    """兩品套件（比率 0.65/0.35）＋三品套件（0.333/0.333/0.334，每套 2 個）。"""
+    return {
+        "29900001": [
+            bundle_split.BundleComponent("A001", "單品A", "SPA", 1.0, 0.65),
+            bundle_split.BundleComponent("A002", "單品B", "SPB", 1.0, 0.35),
+        ],
+        "29900002": [
+            bundle_split.BundleComponent("B001", "面膜1", "", 2.0, 0.333),
+            bundle_split.BundleComponent("B002", "面膜2", "", 2.0, 0.333),
+            bundle_split.BundleComponent("B003", "面膜3", "", 2.0, 0.334),
+        ],
+    }
+
+
+def _split_result(rows):
+    return bundle_split.split_rows([_SPLIT_HEADER] + rows, _split_map(), "來源.xls", "對照.xlsx")
+
+
+def test_split_expands_qty_and_keeps_amount_total():
+    result = _split_result([
+        ["S1", "29900001", "兩品組", "商品", 3, 500, 1000],
+        ["S1", "101000000001", "一般單品", "商品", 2, 300, 600],
+    ])
+    assert result.output_rows == 3          # 套件拆 2 列 + 原樣保留 1 列
+    assert result.split_rows == 1
+    assert result.component_rows == 2
+    assert result.amount_matched
+    assert result.amount_before == result.amount_after == 1600
+    qty_index = _SPLIT_HEADER.index("數量")
+    sku_index = _SPLIT_HEADER.index("商品貨號")
+    amount_index = _SPLIT_HEADER.index("含稅金額")
+    exploded = [r for r in result.preview_rows if r[sku_index] in ("A001", "A002")]
+    assert [r[qty_index] for r in exploded] == [3, 3]
+    # 650/350，且來源金額是整數時拆出來也維持整數
+    assert [r[amount_index] for r in exploded] == [650, 350]
+    assert all(isinstance(r[amount_index], int) for r in exploded)
+
+
+def test_split_rounding_remainder_goes_to_largest_ratio():
+    # 864 × (0.333, 0.333, 0.334) 個別四捨五入會多 1 元，尾差要吃回比率最大者
+    result = _split_result([["S1", "29900002", "三品組", "商品", 1, 999, 864]])
+    amount_index = _SPLIT_HEADER.index("含稅金額")
+    qty_index = _SPLIT_HEADER.index("數量")
+    amounts = [r[amount_index] for r in result.preview_rows]
+    assert sum(amounts) == 864
+    assert amounts == [288, 288, 288]
+    assert [r[qty_index] for r in result.preview_rows] == [2, 2, 2]  # 每套數量 2
+
+
+def test_split_marks_and_labels_rows():
+    result = _split_result([
+        ["S1", "29900001", "兩品組", "商品", 1, 500, 1000],
+        ["S1", "101000000001", "一般單品", "商品", 1, 300, 300],
+    ])
+    columns = result.preview_columns
+    status = columns.index("拆解狀態")
+    source_sku = columns.index("組合來源料號")
+    assert result.preview_rows[0][status] == bundle_split.STATUS_SPLIT
+    assert result.preview_rows[0][source_sku] == "29900001"
+    assert result.preview_rows[0][columns.index("組合來源品名")] == "兩品組"
+    assert result.preview_rows[-1][status] == bundle_split.STATUS_KEPT
+    assert result.preview_rows[-1][source_sku] == ""
+
+
+def test_split_gift_zero_amount_and_unmapped_bundle_warning():
+    result = _split_result([
+        ["S1", "29900001", "兩品組", "贈品", 1, 0, 0],
+        ["S1", "29826012", "未對照的組", "贈品", 1, 0, 0],
+    ])
+    amount_index = _SPLIT_HEADER.index("含稅金額")
+    assert [r[amount_index] for r in result.preview_rows[:2]] == [0, 0]
+    assert [r["商品貨號"] for r in result.unmapped_rows] == ["29826012"]
+    assert result.unmapped_rows[0]["出現列數"] == 1
+    assert any("不在對照表" in w for w in result.warnings)
+
+
+def test_split_missing_required_column_raises():
+    try:
+        bundle_split.split_rows([["單號", "商品名稱"], ["S1", "X"]], _split_map())
+    except bundle_split.BundleSplitError as exc:
+        assert "商品貨號" in str(exc)
+    else:
+        raise AssertionError("缺少商品貨號欄位應該要報錯")
+
+
+def test_load_bundle_map_normalizes_and_rejects_unknown_format():
+    header = ["套件品號", "單品品號", "單品品名", "規格", "每套數量", "分攤比率"]
+    headers = build_header_map(header)
+    # 比率未正規化（加總 4）→ 載入後各 0.5
+    rows = [["29900003", "C001", "單品C", "", 1, 2], ["29900003", "C002", "單品D", "", 1, 2]]
+    comps = bundle_split._load_simple(rows, headers)["29900003"]
+    assert [round(c.ratio, 6) for c in comps] == [0.5, 0.5]
+    # 比率全空時平均分攤
+    blank = [["29900004", "E001", "", "", 1, ""], ["29900004", "E002", "", "", 1, ""]]
+    comps = bundle_split._load_simple(blank, headers)["29900004"]
+    assert [round(c.ratio, 6) for c in comps] == [0.5, 0.5]
+    # 欄位認不出來要報錯，而不是安靜回傳空對照表
+    unknown = _spreadsheetml([["欄一", "欄二"], ["a", "b"]])
+    try:
+        bundle_split.load_bundle_map(unknown, "unknown.xls")
+    except bundle_split.BundleSplitError as exc:
+        assert "無法辨識" in str(exc)
+    else:
+        raise AssertionError("無法辨識的對照表格式應該要報錯")
+
+
+def _spreadsheetml(rows: list[list[str]]) -> bytes:
+    """組一份最小的 SpreadsheetML（NetSuite .xls 的格式），供讀檔路徑測試。"""
+    cells = "".join(
+        "<ss:Row>" + "".join(
+            f'<ss:Cell><ss:Data ss:Type="String">{value}</ss:Data></ss:Cell>' for value in row
+        ) + "</ss:Row>"
+        for row in rows
+    )
+    return (
+        '<?xml version="1.0"?>'
+        '<Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'
+        f'<ss:Worksheet ss:Name="S1"><ss:Table>{cells}</ss:Table></ss:Worksheet></Workbook>'
+    ).encode("utf-8")
 
 
 # ------------------------------------------------------------------ 執行器

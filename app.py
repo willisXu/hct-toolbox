@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""HCT 工具箱 — 四合一網頁介面（Streamlit）。
+"""HCT 工具箱 — 網頁介面（Streamlit）。
 
 分頁對應原本的 Excel VBA 工具，另外加了 NetSuite 直接抓取與退貨核對：
   1. 訂單轉換     ← HCT出貨單轉換程式(訂單)
@@ -7,6 +7,7 @@
   3. 表格核對     ← HCT表格核對工具
   4. 退貨核對     ← 客戶退貨授權明細 × HCT 退貨入庫格式
   5. 庫存核對     ← 庫存核對工具
+  6. ED 訂單拆解  ← 每日銷售串接訂單明細的 299 組合料號 → 單品
 
 注意：轉換結果一律存進 st.session_state 再顯示。
 按下載鈕時 Streamlit 會整頁重跑，若結果只活在「開始轉換」的 if 區塊裡,
@@ -22,6 +23,7 @@ import pandas as pd
 import streamlit as st
 import yaml
 
+from core import bundle_split as bundle_split_mod
 from core import compare as compare_mod
 from core import inventory as inventory_mod
 from core import m00 as m00_mod
@@ -32,6 +34,7 @@ from core import shipping
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "mappings" / "HCT範本.xlsx"
 M00_TEMPLATE_PATH = BASE_DIR / "mappings" / "M00出貨格式.xlsx"
+BUNDLE_MAP_PATH = BASE_DIR / "mappings" / "組合對照表.xlsx"
 
 FORMAT_HCT = "HCT 銷貨報表格式"
 FORMAT_M00 = "M00 出貨格式"
@@ -123,8 +126,12 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
                 st.text(f"• {warning}")
 
 
-tab_order, tab_transfer, tab_netsuite, tab_compare, tab_return, tab_inventory = st.tabs(
-    ["🛒 訂單轉換", "🔄 調撥單轉換", "🔗 NetSuite 直接抓取", "🔍 表格核對", "🔁 退貨核對", "📊 庫存核對"]
+(
+    tab_order, tab_transfer, tab_netsuite, tab_compare,
+    tab_return, tab_inventory, tab_bundle,
+) = st.tabs(
+    ["🛒 訂單轉換", "🔄 調撥單轉換", "🔗 NetSuite 直接抓取", "🔍 表格核對",
+     "🔁 退貨核對", "📊 庫存核對", "🧩 ED 訂單拆解"]
 )
 
 with tab_order:
@@ -449,5 +456,121 @@ with tab_inventory:
             key="inv_download",
         )
 
+# ------------------------------------------------------------ ED 訂單拆解
+
+
+@st.cache_data(show_spinner=False)
+def _builtin_bundle_map_bytes() -> bytes | None:
+    """讀內建組合對照表；檔案不在（例如部署時漏帶）就回 None，改請使用者上傳。"""
+    try:
+        return BUNDLE_MAP_PATH.read_bytes()
+    except OSError:
+        return None
+
+
+with tab_bundle:
+    st.subheader("ED 訂單明細 299 組合料號 → 單品明細")
+    st.markdown(
+        "把 NetSuite「每日銷售串接訂單明細」裡的架上組（299 開頭的虛擬組合料號）"
+        "展開成單品列：**數量 × 每套數量**、**含稅金額依分攤比率拆分**"
+        "（尾差併入比率最大的單品，拆解前後金額總計完全一致），"
+        "其餘欄位原樣複製；非組合料號的明細列原樣保留。\n\n"
+        "1. 上傳 **每日銷售串接訂單明細**（.xls / .xlsx）\n"
+        "2. 組合對照表預設用內建的那份；有更新時可在下方展開區上傳新的覆蓋\n"
+        "3. 按「開始拆解」，完成後點「下載結果」"
+    )
+
+    bundle_file = st.file_uploader(
+        "選擇每日銷售串接訂單明細", type=["xls", "xlsx", "xlsm"], key="bundle_order_file"
+    )
+
+    builtin_bytes = _builtin_bundle_map_bytes()
+    with st.expander("組合對照表（預設用內建版本，需要更新時才上傳）"):
+        if builtin_bytes:
+            st.download_button(
+                f"⬇️ 下載目前內建的對照表（{BUNDLE_MAP_PATH.name}）",
+                data=builtin_bytes,
+                file_name=BUNDLE_MAP_PATH.name,
+                mime=EXCEL_MIME,
+                key="bundle_map_download",
+            )
+            st.caption(
+                "欄位：套件品號／單品品號／單品品名／規格／每套數量／分攤比率。"
+                "同一套件的分攤比率加總應為 1（程式載入時會再正規化一次）。"
+                "也可直接上傳 ERP 匯出的 MDxxx 原始格式。"
+            )
+        else:
+            st.warning(f"找不到內建對照表（{BUNDLE_MAP_PATH.name}），請在下方上傳一份。")
+        map_file = st.file_uploader(
+            "上傳新的組合對照表（可留空）", type=["xls", "xlsx", "xlsm"], key="bundle_map_file"
+        )
+
+    map_data = map_file.getvalue() if map_file is not None else builtin_bytes
+    map_name = map_file.name if map_file is not None else BUNDLE_MAP_PATH.name
+
+    if bundle_file is not None and map_data is None:
+        st.error("沒有可用的組合對照表，請先上傳一份再拆解。")
+    elif bundle_file is not None and st.button("🚀 開始拆解", key="bundle_run", type="primary"):
+        try:
+            with st.spinner("拆解中..."):
+                result = bundle_split_mod.split(
+                    bundle_file.getvalue(), bundle_file.name, map_data, map_name
+                )
+        except Exception as exc:  # noqa: BLE001
+            st.session_state.pop("bundle_result", None)
+            _show_error(exc)
+        else:
+            st.session_state["bundle_result"] = result
+
+    result = st.session_state.get("bundle_result")
+    if result:
+        st.success(
+            f"「{result.source_name}」拆解完成！"
+            f"來源明細 **{result.source_rows}** 列 → 拆解後 **{result.output_rows}** 列"
+        )
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("對照表套件數", result.bundle_count)
+        metric_cols[1].metric("被拆解的組合列", result.split_rows)
+        metric_cols[2].metric("展開的單品列", result.component_rows)
+        metric_cols[3].metric("用到的套件品號", result.used_bundles)
+        metric_cols[4].metric(
+            "含稅金額合計",
+            f"{result.amount_after:,.0f}",
+            delta=None if result.amount_matched else f"{result.amount_after - result.amount_before:,.2f}",
+        )
+        if result.amount_matched:
+            st.caption(f"✅ 拆解前後含稅金額一致：{result.amount_before:,.2f}")
+        else:
+            st.error(
+                f"拆解前後含稅金額不一致（前 {result.amount_before:,.2f}、"
+                f"後 {result.amount_after:,.2f}），請回報此問題。"
+            )
+        st.download_button(
+            f"⬇️ 下載結果（{result.output_name}）",
+            data=result.output_bytes,
+            file_name=result.output_name,
+            mime=EXCEL_MIME,
+            key="bundle_download",
+        )
+        if result.unmapped_rows:
+            st.warning(
+                f"有 {len(result.unmapped_rows)} 個料號看起來是組合品但不在對照表裡，"
+                "已原樣保留未拆解；如需拆解請把它補進組合對照表。"
+            )
+            st.dataframe(result.unmapped_rows, use_container_width=True)
+        if result.preview_rows:
+            with st.expander(
+                f"預覽拆解後明細（前 {len(result.preview_rows)} 列，完整結果請下載）"
+            ):
+                st.dataframe(
+                    pd.DataFrame(result.preview_rows, columns=result.preview_columns),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        if result.warnings:
+            with st.expander(f"⚠️ 警告訊息（{len(result.warnings)} 則）"):
+                for warning in result.warnings:
+                    st.text(f"• {warning}")
+
 st.divider()
-st.caption(f"HCT 工具箱 v1.1 ｜ 請用「下載結果」按鈕保存檔案 ｜ {datetime.now():%Y-%m-%d}")
+st.caption(f"HCT 工具箱 v1.2 ｜ 請用「下載結果」按鈕保存檔案 ｜ {datetime.now():%Y-%m-%d}")
