@@ -280,13 +280,23 @@ def test_split_marks_and_labels_rows():
 def test_split_gift_zero_amount_and_unmapped_bundle_warning():
     result = _split_result([
         ["S1", "29900001", "兩品組", "贈品", 1, 0, 0],
-        ["S1", "29826012", "未對照的組", "贈品", 1, 0, 0],
+        ["S1", "29900099", "未對照的架上組", "贈品", 1, 0, 0],
     ])
     amount_index = _SPLIT_HEADER.index("含稅金額")
     assert [r[amount_index] for r in result.preview_rows[:2]] == [0, 0]
-    assert [r["商品貨號"] for r in result.unmapped_rows] == ["29826012"]
+    assert [r["商品貨號"] for r in result.unmapped_rows] == ["29900099"]
     assert result.unmapped_rows[0]["出現列數"] == 1
     assert any("不在對照表" in w for w in result.warnings)
+
+
+def test_split_298_is_a_real_product_not_an_unmapped_bundle():
+    """298 開頭是正常組合品（ERP 有自己的品號與庫存），不拆也不該被當成漏對照。"""
+    result = _split_result([["S1", "29826012", "杏仁酸煥膚透亮組", "商品", 1, 556, 556]])
+    columns = result.preview_columns
+    assert result.split_rows == 0
+    assert result.preview_rows[0][columns.index("拆解狀態")] == bundle_split.STATUS_KEPT
+    assert result.unmapped_rows == []
+    assert result.warnings == []
 
 
 def test_split_missing_required_column_raises():
