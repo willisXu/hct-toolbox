@@ -17,6 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 from core import bundle_split
+from core import inventory
 from core.compare import _normalize_customer, _normalize_order_id
 from core.inventory import _normalize_date, _normalize_item, _normalize_location, _qty_equal
 from core.m00 import convert_rows as m00_convert_rows
@@ -120,6 +121,59 @@ def test_inventory_excel_error_treated_as_blank():
 def test_inventory_quantity_tolerance():
     assert _qty_equal(0.1 + 0.2, 0.3)
     assert not _qty_equal(10.0, 10.5)
+
+
+def test_inventory_contract_reconcile_against_ns293():
+    """代工廠庫存核對報表 × NetSuite:只看 D 倉、排除合計列、單一數量欄當兩用。"""
+    contract = _spreadsheetml([
+        ["庫存日期", "倉別", "倉別名稱", "品號", "品名", "批號", "庫存數量"],
+        ["20260724", "D01", "凱芬妮倉", "300020400025", "品A", "", "100"],
+        ["20260724", "D01", "凱芬妮倉", "300020400026", "品B", "", "50"],
+        ["", "", "凱芬妮倉 合計", "", "", "", "150"],
+        ["20260724", "E01", "非代工廠倉", "300020400027", "品C", "", "10"],
+        ["", "", "總計", "", "", "", "160"],
+    ])
+    ns293 = _spreadsheetml([
+        ["地點", "到期日", "項目", "庫存數 總和"],
+        ["D01_凱芬妮", "", "300020400025_X", "90"],
+        ["D01_凱芬妮", "", "300020400026_X", "50"],
+        ["G10", "", "300020400028_X", "5"],
+    ])
+    assert inventory.detect_source(contract, "c.xls") == inventory.SYSTEM_CONTRACT
+
+    result = inventory.reconcile(ns293, "ns.xls", contract, "c.xls")
+    assert result.ext_label == inventory.SYSTEM_CONTRACT
+    assert result.output_name.startswith("代工廠庫存核對結果_")
+    # 代工廠側排除:合計/總計列 2 筆 + 非 D 倉 1 筆;NetSuite 側排除 G10 1 筆
+    assert result.hct_stats.excluded_rows == 3
+    assert result.ns_stats.excluded_rows == 1
+    assert result.anomalies == []
+    by_item = {r["料號"]: r for r in result.item_rows}
+    assert by_item["300020400025"]["代工廠 庫存數量"] == 100
+    assert by_item["300020400025"]["總庫存差額"] == 10
+    assert by_item["300020400025"]["狀態"] == inventory.STATUS_BOTH_DIFF
+    assert by_item["300020400026"]["狀態"] == inventory.STATUS_MATCH
+    assert "僅 代工廠 存在" in result.statuses
+
+
+def test_inventory_hct_reconcile_output_unchanged():
+    """原本的 HCT × NetSuite 流程不受新格式影響(欄名、檔名、狀態清單)。"""
+    hct = _spreadsheetml([
+        ["儲區類別", "客戶產品編號", "有效日期", "可出數量", "庫存數量", "產品名稱"],
+        ["G10", "SKU1", "20270501", "10", "12", "品A"],
+        ["Z99", "SKU2", "", "1", "1", "排除"],
+    ])
+    ns = _spreadsheetml([
+        ["地點", "到期日", "DR_料號", "項目計數 總和", "數量 總和"],
+        ["G10_X", "2027/5/1", "SKU1", "10", "12"],
+    ])
+    result = inventory.reconcile(hct, "hct.xls", ns, "ns.xls")
+    assert result.ext_label == inventory.SYSTEM_HCT
+    assert result.output_name.startswith("庫存核對結果_")
+    assert result.statuses == inventory.ALL_STATUSES
+    assert result.hct_stats.excluded_rows == 1
+    assert result.item_rows[0]["HCT 可出數量"] == 10
+    assert result.item_rows[0]["狀態"] == inventory.STATUS_MATCH
 
 
 # ------------------------------------------------------------------ 到貨日欄位比對

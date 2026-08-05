@@ -411,12 +411,17 @@ with tab_return:
 # ------------------------------------------------------------ 庫存核對
 
 with tab_inventory:
-    st.subheader("HCT × NetSuite 庫存核對")
+    st.subheader("HCT／代工廠 × NetSuite 庫存核對")
     st.markdown(
-        "上傳 **HCT 庫存報表** 與 **NetSuite 庫存報表** 各一份，順序不限，程式會自動辨識。\n\n"
+        "上傳 **HCT（或代工廠）庫存報表** 與 **NetSuite 庫存報表** 各一份，順序不限，"
+        "程式會自動辨識。\n\n"
         "NetSuite 報表支援三種格式：物流核對版（DR_料號/庫存編號/在庫量/可用）、"
         "業務助理版（項目/庫存數 總和）、舊版（DR_料號/項目計數 總和/數量 總和）。\n\n"
-        "只核對 G00 / G10 / G30 / G40 / G80 / G90 倉，差異基準為 **HCT－NetSuite**。"
+        "另一份可以是 **HCT 庫存報表**（儲區類別/客戶產品編號/有效日期/可出數量/庫存數量），"
+        "或 **代工廠庫存核對報表**（庫存日期/倉別/品號/品名/批號/庫存數量）。\n\n"
+        "HCT 對帳只核對 G00 / G10 / G30 / G40 / G80 / G90 倉；"
+        "代工廠對帳只核對 **D 開頭代工廠倉**（合計／總計列自動排除，"
+        "「庫存數量」同時當作可出與庫存數量）。差異基準為 **HCT／代工廠－NetSuite**。"
     )
     col1, col2 = st.columns(2)
     with col1:
@@ -446,7 +451,8 @@ with tab_inventory:
             f"資料異常 **{len(result.anomalies)}** 筆"
         )
         metric_cols = st.columns(6)
-        for idx, status in enumerate(inventory_mod.ALL_STATUSES):
+        statuses = getattr(result, "statuses", inventory_mod.ALL_STATUSES)
+        for idx, status in enumerate(statuses):
             metric_cols[idx].metric(status, result.item_status_counts.get(status, 0))
         st.download_button(
             f"⬇️ 下載核對結果（{result.output_name}）",

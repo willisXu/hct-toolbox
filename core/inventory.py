@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-"""HCT × NetSuite 庫存核對（由 VBA modInventory* 模組移植）。
+"""HCT／代工廠 × NetSuite 庫存核對(由 VBA modInventory* 模組移植)。
 
   - NetSuite 報表欄位：地點、到期日、DR_料號、項目計數 總和、數量 總和
   - HCT 報表欄位：儲區類別、有效日期、客戶產品編號、可出數量、庫存數量
-  - 只核對 G00/G10/G30/G40/G80/G90 倉；其他倉別列入排除數。
+  - 代工廠報表欄位：庫存日期、倉別、品號、品名、批號、庫存數量
+  - HCT 對帳只核對 G00/G10/G30/G40/G80/G90 倉；代工廠對帳只核對 D 開頭
+    代工廠倉(D01 凱芬妮、D03 詠麗…)，其他倉別與「合計／總計」列列入排除數。
+  - 代工廠報表只有一個「庫存數量」欄，同時當作可用量與總庫存量(同 293 格式)。
   - 以「倉別+料號+到期日」做日期明細核對，另以「倉別+料號」做料號彙總核對。
-  - 差異基準：HCT－NetSuite。
+  - 差異基準：HCT／代工廠－NetSuite。
 """
 from __future__ import annotations
 
@@ -16,8 +19,10 @@ from datetime import date, datetime
 from .xlio import is_excel_error_text, read_workbook, try_parse_date
 
 SYSTEM_HCT = "HCT"
+SYSTEM_CONTRACT = "代工廠"
 SYSTEM_NETSUITE = "NetSuite"
 APPROVED_LOCATIONS = {"G00", "G10", "G30", "G40", "G80", "G90"}
+CONTRACT_LOCATION_PREFIX = "D"
 
 STATUS_MATCH = "完全一致"
 STATUS_AVAILABLE_DIFF = "僅可用量差異"
@@ -25,10 +30,21 @@ STATUS_TOTAL_DIFF = "僅總庫存差異"
 STATUS_BOTH_DIFF = "兩者皆不同"
 STATUS_HCT_ONLY = "僅 HCT 存在"
 STATUS_NS_ONLY = "僅 NetSuite 存在"
-ALL_STATUSES = [
-    STATUS_MATCH, STATUS_AVAILABLE_DIFF, STATUS_TOTAL_DIFF,
-    STATUS_BOTH_DIFF, STATUS_HCT_ONLY, STATUS_NS_ONLY,
-]
+
+
+def _ext_only_status(ext_label: str) -> str:
+    return f"僅 {ext_label} 存在"
+
+
+def status_order(ext_label: str = SYSTEM_HCT) -> list[str]:
+    """依外部系統(HCT／代工廠)產生狀態清單；「僅 X 存在」隨系統改名。"""
+    return [
+        STATUS_MATCH, STATUS_AVAILABLE_DIFF, STATUS_TOTAL_DIFF,
+        STATUS_BOTH_DIFF, _ext_only_status(ext_label), STATUS_NS_ONLY,
+    ]
+
+
+ALL_STATUSES = status_order()
 
 _NS_HEADERS = ["地點", "到期日", "DR_料號", "項目計數 總和", "數量 總和"]
 # 業務助理版 NetSuite 庫存報表（293 格式）：料號取「項目」底線前段，
@@ -38,6 +54,9 @@ _NS293_HEADERS = ["地點", "到期日", "項目", "庫存數 總和"]
 # 底線前段），到期日在「庫存編號」欄，可用量=可用、總庫存量=在庫量。
 _NS663_HEADERS = ["項目", "DR_料號", "地點", "庫存編號", "在庫量", "可用"]
 _HCT_HEADERS = ["客戶產品編號", "有效日期", "儲區類別", "可出數量", "庫存數量"]
+# 代工廠庫存核對報表：只有一個「庫存數量」欄，同時當作可用量與總庫存量；
+# 「批號」放到期日欄位(目前多為空白＝無到期日)，「合計／總計」小計列會被排除。
+_CONTRACT_HEADERS = ["庫存日期", "倉別", "品號", "品名", "庫存數量"]
 
 SYSTEM_NETSUITE_293 = "NetSuite293"
 SYSTEM_NETSUITE_663 = "NetSuite663"
@@ -68,6 +87,8 @@ class InventoryResult:
     ns_stats: SourceStats
     detail_status_counts: dict = field(default_factory=dict)
     item_status_counts: dict = field(default_factory=dict)
+    ext_label: str = SYSTEM_HCT
+    statuses: list = field(default_factory=lambda: list(ALL_STATUSES))
 
 
 # ------------------------------------------------------------------ 正規化
@@ -161,6 +182,8 @@ def detect_source(data: bytes, filename: str) -> str:
         matches.append(SYSTEM_NETSUITE_293)
     if _find_matching_sheet(book, _HCT_HEADERS):
         matches.append(SYSTEM_HCT)
+    if _find_matching_sheet(book, _CONTRACT_HEADERS):
+        matches.append(SYSTEM_CONTRACT)
     if len(matches) > 1:
         raise InventoryError(
             f"{filename}:同時符合多種報表格式（{'、'.join(matches)}），無法自動判斷，"
@@ -171,10 +194,12 @@ def detect_source(data: bytes, filename: str) -> str:
 
 def _import_source(data: bytes, filename: str, system: str,
                    detail: dict, item_totals: dict, anomalies: list,
-                   stats: SourceStats) -> None:
+                   stats: SourceStats, location_ok) -> None:
     book = read_workbook(data, filename)
     if system == SYSTEM_HCT:
         required = _HCT_HEADERS
+    elif system == SYSTEM_CONTRACT:
+        required = _CONTRACT_HEADERS
     elif system == SYSTEM_NETSUITE_293:
         required = _NS293_HEADERS
     elif system == SYSTEM_NETSUITE_663:
@@ -198,6 +223,12 @@ def _import_source(data: bytes, filename: str, system: str,
         expiry_col, available_col, total_col = col("有效日期"), col("可出數量"), col("庫存數量")
         desc_col = col("產品名稱")
         field_names = ("儲區類別", "客戶產品編號", "有效日期", "可出數量", "庫存數量")
+    elif system == SYSTEM_CONTRACT:
+        location_col, item_col = col("倉別"), col("品號")
+        expiry_col = col("批號")
+        available_col = total_col = col("庫存數量")
+        desc_col = col("品名")
+        field_names = ("倉別", "品號", "批號", "庫存數量", "庫存數量")
     elif system == SYSTEM_NETSUITE_293:
         location_col, item_col = col("地點"), col("項目")
         expiry_col = col("到期日")
@@ -235,6 +266,12 @@ def _import_source(data: bytes, filename: str, system: str,
         actual_row = row_index + 1
         has_issue = False
 
+        if system == SYSTEM_CONTRACT and not _normalize_location(get(row, location_col)) \
+                and not _normalize_item(get(row, item_col)):
+            # 代工廠報表的「XX倉 合計」「總計」小計列：倉別與品號皆空白，列入排除數。
+            stats.excluded_rows += 1
+            continue
+
         def anomaly(field_name: str, raw_value: object, issue: str) -> None:
             display_system = SYSTEM_NETSUITE if system.startswith(SYSTEM_NETSUITE) else system
             anomalies.append({
@@ -248,7 +285,7 @@ def _import_source(data: bytes, filename: str, system: str,
         if not location:
             anomaly(field_names[0], get(row, location_col), "倉別不可空白")
             has_issue = True
-        elif location not in APPROVED_LOCATIONS:
+        elif not location_ok(location):
             stats.excluded_rows += 1
             continue
 
@@ -309,13 +346,13 @@ def _qty_equal(a: float, b: float) -> bool:
 
 
 def _classify(has_hct: bool, has_ns: bool, hct_avail: float, hct_total: float,
-              ns_avail: float, ns_total: float) -> tuple[str, str]:
+              ns_avail: float, ns_total: float, ext_label: str) -> tuple[str, str]:
     if not has_ns:
-        return STATUS_HCT_ONLY, "HCT 有庫存資料，NetSuite 未找到對應資料"
+        return _ext_only_status(ext_label), f"{ext_label} 有庫存資料，NetSuite 未找到對應資料"
     if not has_hct:
-        return STATUS_NS_ONLY, "NetSuite 有庫存資料，HCT 未找到對應資料"
+        return STATUS_NS_ONLY, f"NetSuite 有庫存資料，{ext_label} 未找到對應資料"
     if _qty_equal(hct_avail, ns_avail) and _qty_equal(hct_total, ns_total):
-        return STATUS_MATCH, "HCT 與 NetSuite 可用量及總庫存量一致"
+        return STATUS_MATCH, f"{ext_label} 與 NetSuite 可用量及總庫存量一致"
     if _qty_equal(hct_total, ns_total):
         return STATUS_AVAILABLE_DIFF, "帳面總量一致，但可出／可用狀態不同"
     if _qty_equal(hct_avail, ns_avail):
@@ -323,7 +360,8 @@ def _classify(has_hct: bool, has_ns: bool, hct_avail: float, hct_total: float,
     return STATUS_BOTH_DIFF, "可用量與總庫存量皆有差異"
 
 
-def _build_reconciliation(hct_data: dict, ns_data: dict, include_expiry: bool) -> list[dict]:
+def _build_reconciliation(hct_data: dict, ns_data: dict, include_expiry: bool,
+                          ext_label: str) -> list[dict]:
     union_keys = sorted(set(hct_data) | set(ns_data), key=lambda k: tuple(str(p).casefold() for p in k))
     result = []
     empty = [0.0, 0.0, 0, ""]
@@ -334,20 +372,21 @@ def _build_reconciliation(hct_data: dict, ns_data: dict, include_expiry: bool) -
         ns_bucket = ns_data.get(key, empty)
         description = hct_bucket[3] or ns_bucket[3]
         status, explanation = _classify(
-            has_hct, has_ns, hct_bucket[0], hct_bucket[1], ns_bucket[0], ns_bucket[1])
+            has_hct, has_ns, hct_bucket[0], hct_bucket[1], ns_bucket[0], ns_bucket[1],
+            ext_label)
         record = {
             "倉別": key[0],
             "料號": key[1],
             "品名／項目": description,
-            "HCT 可出數量": hct_bucket[0],
+            f"{ext_label} 可出數量": hct_bucket[0],
             "NetSuite 項目計數": ns_bucket[0],
             "可用量差額": hct_bucket[0] - ns_bucket[0],
-            "HCT 庫存數量": hct_bucket[1],
+            f"{ext_label} 庫存數量": hct_bucket[1],
             "NetSuite 數量": ns_bucket[1],
             "總庫存差額": hct_bucket[1] - ns_bucket[1],
             "狀態": status,
             "結果說明": explanation,
-            "HCT 來源列數": hct_bucket[2],
+            f"{ext_label} 來源列數": hct_bucket[2],
             "NetSuite 來源列數": ns_bucket[2],
         }
         if include_expiry:
@@ -362,20 +401,40 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
         raise InventoryError("兩次選取的是同一個檔案，請重新選擇不同的來源檔案。")
     first_system = detect_source(ns_data, ns_name)
     if not first_system:
-        raise InventoryError(f"無法辨識檔案:{ns_name}(找不到 NetSuite 或 HCT 的必要欄位)")
+        raise InventoryError(
+            f"無法辨識檔案:{ns_name}(找不到 NetSuite、HCT 或代工廠報表的必要欄位)")
     second_system = detect_source(hct_data, hct_name)
     if not second_system:
-        raise InventoryError(f"無法辨識檔案:{hct_name}(找不到 NetSuite 或 HCT 的必要欄位)")
+        raise InventoryError(
+            f"無法辨識檔案:{hct_name}(找不到 NetSuite、HCT 或代工廠報表的必要欄位)")
 
     ns_variants = (SYSTEM_NETSUITE, SYSTEM_NETSUITE_293, SYSTEM_NETSUITE_663)
-    if first_system == SYSTEM_HCT and second_system in ns_variants:
+    ext_variants = (SYSTEM_HCT, SYSTEM_CONTRACT)
+    if first_system in ext_variants and second_system in ns_variants:
         ns_data, hct_data = hct_data, ns_data
         ns_name, hct_name = hct_name, ns_name
-        ns_system = second_system
-    elif first_system in ns_variants and second_system == SYSTEM_HCT:
-        ns_system = first_system
+        ns_system, ext_system = second_system, first_system
+    elif first_system in ns_variants and second_system in ext_variants:
+        ns_system, ext_system = first_system, second_system
     else:
-        raise InventoryError("兩份檔案無法配成一份 NetSuite 與一份 HCT 報表，請重新選取。")
+        raise InventoryError(
+            "兩份檔案無法配成一份 NetSuite 與一份 HCT(或代工廠)報表，請重新選取。")
+
+    if ext_system == SYSTEM_CONTRACT:
+        # 代工廠對帳只看 D 開頭代工廠倉(兩邊都套同一條規則)。
+        def location_ok(location: str) -> bool:
+            return location.startswith(CONTRACT_LOCATION_PREFIX)
+        ext_label = SYSTEM_CONTRACT
+        scope_text = f"{CONTRACT_LOCATION_PREFIX} 開頭代工廠倉"
+        excluded_label = "排除非 D 倉／合計列筆數"
+        output_prefix = "代工廠庫存核對結果"
+    else:
+        def location_ok(location: str) -> bool:
+            return location in APPROVED_LOCATIONS
+        ext_label = SYSTEM_HCT
+        scope_text = "、".join(sorted(APPROVED_LOCATIONS))
+        excluded_label = "排除非 G 倉筆數"
+        output_prefix = "庫存核對結果"
 
     hct_detail: dict = {}
     hct_items: dict = {}
@@ -385,15 +444,20 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
     hct_stats = SourceStats(file_name=hct_name)
     ns_stats = SourceStats(file_name=ns_name)
 
-    _import_source(ns_data, ns_name, ns_system, ns_detail, ns_items, anomalies, ns_stats)
-    _import_source(hct_data, hct_name, SYSTEM_HCT, hct_detail, hct_items, anomalies, hct_stats)
+    _import_source(ns_data, ns_name, ns_system, ns_detail, ns_items, anomalies, ns_stats,
+                   location_ok)
+    _import_source(hct_data, hct_name, ext_system, hct_detail, hct_items, anomalies, hct_stats,
+                   location_ok)
 
-    detail_rows = _build_reconciliation(hct_detail, ns_detail, include_expiry=True)
-    item_rows = _build_reconciliation(hct_items, ns_items, include_expiry=False)
+    detail_rows = _build_reconciliation(hct_detail, ns_detail, include_expiry=True,
+                                        ext_label=ext_label)
+    item_rows = _build_reconciliation(hct_items, ns_items, include_expiry=False,
+                                      ext_label=ext_label)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
-        output_bytes = _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats)
+        output_bytes = _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats,
+                                     ext_label, scope_text, excluded_label)
     except Exception as exc:
         raise InventoryError(f"建立輸出檔時發生錯誤：{exc}") from exc
 
@@ -405,7 +469,7 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
 
     return InventoryResult(
         output_bytes=output_bytes,
-        output_name=f"庫存核對結果_{stamp}.xlsx",
+        output_name=f"{output_prefix}_{stamp}.xlsx",
         detail_rows=detail_rows,
         item_rows=item_rows,
         anomalies=anomalies,
@@ -413,34 +477,43 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
         ns_stats=ns_stats,
         detail_status_counts=counts(detail_rows),
         item_status_counts=counts(item_rows),
+        ext_label=ext_label,
+        statuses=status_order(ext_label),
     )
 
 
 # ------------------------------------------------------------------ 輸出
 
-_DETAIL_COLUMNS = [
-    "倉別", "料號", "品名／項目", "到期日", "HCT 可出數量", "NetSuite 項目計數",
-    "可用量差額", "HCT 庫存數量", "NetSuite 數量", "總庫存差額", "狀態", "結果說明",
-    "HCT 來源列數", "NetSuite 來源列數",
-]
-_ITEM_COLUMNS = [
-    "倉別", "料號", "品名／項目", "HCT 可出數量", "NetSuite 項目計數",
-    "可用量差額", "HCT 庫存數量", "NetSuite 數量", "總庫存差額", "狀態", "結果說明",
-    "HCT 來源列數", "NetSuite 來源列數",
-]
+def _detail_columns(ext_label: str) -> list[str]:
+    return [
+        "倉別", "料號", "品名／項目", "到期日", f"{ext_label} 可出數量", "NetSuite 項目計數",
+        "可用量差額", f"{ext_label} 庫存數量", "NetSuite 數量", "總庫存差額", "狀態", "結果說明",
+        f"{ext_label} 來源列數", "NetSuite 來源列數",
+    ]
+
+
+def _item_columns(ext_label: str) -> list[str]:
+    columns = _detail_columns(ext_label)
+    columns.remove("到期日")
+    return columns
+
+
 _ANOMALY_COLUMNS = ["來源系統", "來源檔名", "工作表", "原始列號", "問題欄位", "原始值", "異常說明"]
 
-_STATUS_FILL = {
-    STATUS_MATCH: ("C6EFCE", "006100"),
-    STATUS_AVAILABLE_DIFF: ("FFEB9C", "9C6500"),
-    STATUS_TOTAL_DIFF: ("FFEB9C", "9C6500"),
-    STATUS_BOTH_DIFF: ("FFC7CE", "9C0006"),
-    STATUS_HCT_ONLY: ("FFC7CE", "9C0006"),
-    STATUS_NS_ONLY: ("FFC7CE", "9C0006"),
-}
+
+def _status_fill(ext_label: str) -> dict:
+    return {
+        STATUS_MATCH: ("C6EFCE", "006100"),
+        STATUS_AVAILABLE_DIFF: ("FFEB9C", "9C6500"),
+        STATUS_TOTAL_DIFF: ("FFEB9C", "9C6500"),
+        STATUS_BOTH_DIFF: ("FFC7CE", "9C0006"),
+        _ext_only_status(ext_label): ("FFC7CE", "9C0006"),
+        STATUS_NS_ONLY: ("FFC7CE", "9C0006"),
+    }
 
 
-def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats) -> bytes:
+def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats,
+                  ext_label=SYSTEM_HCT, scope_text="", excluded_label="排除非 G 倉筆數") -> bytes:
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -464,7 +537,7 @@ def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats) -> byt
     def count_rows(rows, status):
         return sum(1 for r in rows if r["狀態"] == status)
 
-    for offset, status in enumerate(ALL_STATUSES):
+    for offset, status in enumerate(status_order(ext_label)):
         summary.cell(4 + offset, 1, status)
         summary.cell(4 + offset, 2, count_rows(detail_rows, status))
         summary.cell(4 + offset, 3, count_rows(item_rows, status))
@@ -473,14 +546,14 @@ def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats) -> byt
     summary["C10"] = len(item_rows)
 
     summary["A12"] = "核對範圍倉別"
-    summary["B12"] = "、".join(sorted(APPROVED_LOCATIONS))
+    summary["B12"] = scope_text or "、".join(sorted(APPROVED_LOCATIONS))
     summary["A13"] = "資料統計"
     summary["A14"] = "項目"
-    summary["B14"] = "HCT"
+    summary["B14"] = ext_label
     summary["C14"] = "NetSuite"
     stat_labels = [
         ("讀取筆數", "rows_read"), ("有效筆數", "valid_rows"),
-        ("排除非 G 倉筆數", "excluded_rows"), ("異常來源列數", "anomaly_rows"),
+        (excluded_label, "excluded_rows"), ("異常來源列數", "anomaly_rows"),
     ]
     for offset, (label, attr) in enumerate(stat_labels):
         summary.cell(15 + offset, 1, label)
@@ -488,7 +561,7 @@ def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats) -> byt
         summary.cell(15 + offset, 3, getattr(ns_stats, attr))
     summary["A19"] = "異常明細筆數"
     summary["B19"] = len(anomalies)
-    summary["A20"] = "HCT 檔案"
+    summary["A20"] = f"{ext_label} 檔案"
     summary["B20"] = hct_stats.file_name
     summary["A21"] = "NetSuite 檔案"
     summary["B21"] = ns_stats.file_name
@@ -528,7 +601,7 @@ def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats) -> byt
                 elif isinstance(value, (int, float)) and header not in ("原始列號",):
                     cell.number_format = "#,##0.####"
                 if status_col is not None and col == status_col:
-                    colors = _STATUS_FILL.get(str(value))
+                    colors = _status_fill(ext_label).get(str(value))
                     if colors:
                         cell.fill = PatternFill("solid", fgColor=colors[0])
                         cell.font = Font(color=colors[1])
@@ -544,8 +617,8 @@ def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats) -> byt
             letter = openpyxl.utils.get_column_letter(col)
             ws.column_dimensions[letter].width = widths.get(header, 16)
 
-    write_table("日期明細", _DETAIL_COLUMNS, detail_rows, status_col=11)
-    write_table("料號彙總", _ITEM_COLUMNS, item_rows, status_col=10)
+    write_table("日期明細", _detail_columns(ext_label), detail_rows, status_col=11)
+    write_table("料號彙總", _item_columns(ext_label), item_rows, status_col=10)
     write_table("資料異常", _ANOMALY_COLUMNS, anomalies, status_col=None)
 
     buffer = io.BytesIO()
