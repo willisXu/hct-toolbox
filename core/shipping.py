@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """HCT 出貨單轉換引擎（訂單 360 格式 / 調撥單 162 格式共用）。
 
-由 VBA modHCTConverter360 / modHCTConverter162 移植，轉換規則完全相同：
+由 VBA modHCTConverter360 / modHCTConverter162 移植（第 4 點為移植後新增）：
   1. 依「預計到貨日 + 出貨客戶 + 門市/倉儲 + 地址」判斷可否跨單合併；
      同收件條件有 >=2 種訂單類型且含「一般銷售訂單」時合併為一張送貨單。
   2. 同送貨單內相同「料號 + 效期」的明細數量加總。
   3. 輸出 36 欄 HCT 銷貨報表（欄位常數取自 HCT範本）。
+  4. 虛擬倉（AD 欄）：來源報表有倉別/地點欄時逐列帶出 G 開頭代碼；
+     沒有該欄（或該列空白）時，料號 9 開頭（陳列/宣傳品，存 G90 倉）
+     輸出 G90 並附警告，其餘沿用範本預設值（G10）。
 """
 from __future__ import annotations
 
@@ -61,6 +64,14 @@ _ALIASES = {
         "門市/倉儲地址": ("倉儲地址",),
     },
 }
+
+# 虛擬倉（輸出第 30 欄）逐列判斷用：來源報表的倉別/地點候選欄名（非必要欄位），
+# 依序取第一個存在的欄。欄位值只要含 G+兩碼數字（如「G10」「G30 出貨倉」）即可辨識。
+_WAREHOUSE_ALIASES = ("虛擬倉", "倉別", "地點", "出貨倉", "出貨地點")
+_WAREHOUSE_CODE_RE = re.compile(r"G\d{2}")
+# 料號 9 開頭為陳列/宣傳品（如 902126060002 POYA 陳列物），實際存放 G90 倉。
+_DISPLAY_MATERIAL_PREFIX = "9"
+DISPLAY_MATERIAL_WAREHOUSE = "G90"
 
 _REQUIRED_HEADERS = {
     MODE_ORDER: [
@@ -287,6 +298,31 @@ def _batch_status_warning(row: list, headers: dict[str, int], row_number: int) -
     return ""
 
 
+def _resolve_warehouse(row: list, headers: dict[str, int], material: str) -> tuple[str, str]:
+    """判斷該列的虛擬倉，回傳 (倉別代碼, 警告)。
+
+    代碼空字串表示交由範本預設值（G10）決定。來源有倉別/地點欄時以欄位值
+    為準；沒有該欄或該列空白時退回料號規則（9 開頭 → G90）。
+    """
+    for name in _WAREHOUSE_ALIASES:
+        if name.casefold() not in headers:
+            continue
+        raw = normalize_text(_cell(row, headers, name))
+        if raw:
+            matched = _WAREHOUSE_CODE_RE.search(raw.upper())
+            if matched:
+                return matched.group(0), ""
+            return "", f"倉別「{raw}」無法辨識出 G 開頭倉別代碼，虛擬倉改用範本預設值。"
+        break
+    if material.startswith(_DISPLAY_MATERIAL_PREFIX):
+        return (
+            DISPLAY_MATERIAL_WAREHOUSE,
+            f"料號 {material} 為 9 開頭（陳列/宣傳品），"
+            f"虛擬倉輸出 {DISPLAY_MATERIAL_WAREHOUSE}，請確認。",
+        )
+    return "", ""
+
+
 def _positive_quantity(value: object) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -506,10 +542,22 @@ def _add_row_to_shipment(
         _add_distinct(warnings, text)
         _add_distinct(shipment.warnings, text)
 
+    warehouse, warehouse_warning = _resolve_warehouse(row, headers, material)
+    if warehouse_warning:
+        _add_distinct(warnings, warehouse_warning)
+        _add_distinct(shipment.warnings, warehouse_warning)
+
     item_key = (material, expiry_key)
     item = shipment.items.get(item_key)
     if item is not None:
         item["quantity"] += quantity
+        if item["warehouse"] != warehouse:
+            text = (
+                f"第 {row_number} 列料號 {material} 倉別（{warehouse or '預設'}）"
+                f"與同單前列（{item['warehouse'] or '預設'}）不一致，輸出以前列為準。"
+            )
+            _add_distinct(warnings, text)
+            _add_distinct(shipment.warnings, text)
     else:
         shipment.items[item_key] = {
             "material": material,
@@ -518,6 +566,7 @@ def _add_row_to_shipment(
             "expiry_value": expiry_value,
             "expiry_key": expiry_key,
             "quantity": quantity,
+            "warehouse": warehouse,
         }
     return 0
 
@@ -551,6 +600,7 @@ _TEXT_COLUMNS = (3, 5, 7, 11, 13, 15)
 #   短日期格式（格式代碼 14，openpyxl 表示為 mm-dd-yy，zh-TW 顯示 yyyy/m/d）。
 _EXPIRY_COLUMN = 33
 _EXPIRY_FORMAT = "mm-dd-yy"
+# 第 30 欄（虛擬倉）的範本值只在 _resolve_warehouse 判斷不出倉別時當預設值用。
 _TEMPLATE_VALUE_COLUMNS = (4, 20, 21, 22, 23, 25, 26, 27, 30, 31, 32, 34)
 
 
@@ -613,11 +663,12 @@ def _write_output(state: dict, mode: str, template_path: Path) -> bytes:
             values[17] = PLATFORM_URL
             values[18] = PLATFORM_SERVICE_PHONE
             values[19] = note
-            for col in (20, 21, 22, 23, 25, 26, 27, 30, 31, 32, 34):
+            for col in (20, 21, 22, 23, 25, 26, 27, 31, 32, 34):
                 values[col] = template_values[col]
             values[24] = CARRIER_NAME
             values[28] = ""
             values[29] = _arrival_text(shipment.arrival_value)
+            values[30] = item["warehouse"] or template_values[30]
             values[33] = item["expiry_value"]
             values[35] = shipment.customer
             values[36] = 1

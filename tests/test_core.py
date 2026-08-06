@@ -261,6 +261,41 @@ def test_e2e_unknown_time_slot_warns():
     assert any("無法對應" in w for w in m00_result.warnings)
 
 
+# ------------------------------------------------------------------ 虛擬倉（輸出第 30 欄）
+
+
+def _output_cell(result, row: int, col: int):
+    import io
+
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(result.output_bytes))
+    return wb["工作表1"].cell(row, col).value
+
+
+def test_e2e_warehouse_from_source_location_column():
+    """來源有地點/倉別欄時，逐列帶出 G 開頭代碼，不再固定填範本值。"""
+    header = _E2E_HEADER + ["地點"]
+    r1 = _e2e_row("2027-05-01", 10) + ["G30 出貨倉"]
+    r2 = _e2e_row("2027-06-01", 5) + ["良品倉"]  # 無法辨識 → 範本預設 + 警告
+    result = shipping_convert_rows([header, r1, r2], MODE_ORDER, TEMPLATE_PATH)
+    assert _output_cell(result, 2, 30) == "G30"
+    assert _output_cell(result, 3, 30) == "G10"
+    assert any("無法辨識" in w for w in result.warnings)
+
+
+def test_e2e_warehouse_display_material_falls_back_to_g90():
+    """來源沒有倉別欄時，料號 9 開頭（陳列/宣傳品）輸出 G90 並附警告。"""
+    normal = _e2e_row("2027-05-01", 10)
+    display = _e2e_row("2027-05-01", 1)
+    display[4] = "902126060002_X"   # 項目
+    display[6] = "902126060002"     # DR_料號
+    result = shipping_convert_rows([_E2E_HEADER, normal, display], MODE_ORDER, TEMPLATE_PATH)
+    assert _output_cell(result, 2, 30) == "G10"   # 一般料號沿用範本預設
+    assert _output_cell(result, 3, 30) == "G90"
+    assert any("902126060002" in w and "G90" in w for w in result.warnings)
+
+
 # ------------------------------------------------------------------ ED 訂單拆解
 
 _SPLIT_HEADER = ["單號", "商品貨號", "商品名稱", "商品類型", "數量", "結帳單價", "含稅金額"]
