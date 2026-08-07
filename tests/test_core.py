@@ -23,6 +23,8 @@ from core.inventory import _normalize_date, _normalize_item, _normalize_location
 from core.m00 import convert_rows as m00_convert_rows
 from core.return_compare import _normalize_expiry as ret_normalize_expiry, _strip_dr_prefix
 from core.shipping import (
+    MEMO_SOURCE_LINE,
+    MEMO_SOURCE_MAIN,
     MODE_ORDER,
     _match_arrival_by_keyword,
     _normalize_arrival,
@@ -259,6 +261,61 @@ def test_e2e_unknown_time_slot_warns():
     rows = [_E2E_HEADER, _e2e_row("2027-05-01", 10, slot="晚（17-20）")]
     m00_result = m00_convert_rows(rows, MODE_ORDER, M00_TEMPLATE_PATH)
     assert any("無法對應" in w for w in m00_result.warnings)
+
+
+# ------------------------------------------------------------------ 備忘錄來源
+
+
+def test_memo_source_picks_line_or_main_column():
+    """來源同時有「備忘錄」與「備忘錄 (主要)」時，依 memo_source 選擇來源欄。"""
+    header = _E2E_HEADER + ["備忘錄", "備忘錄 (主要)"]
+    row = _e2e_row("2027-05-01", 10) + ["明細行備註", "主要備註"]
+    result_line = shipping_convert_rows(
+        [header, row], MODE_ORDER, TEMPLATE_PATH, memo_source=MEMO_SOURCE_LINE
+    )
+    result_main = shipping_convert_rows(
+        [header, row], MODE_ORDER, TEMPLATE_PATH, memo_source=MEMO_SOURCE_MAIN
+    )
+    assert "明細行備註" in _output_cell(result_line, 2, 19)
+    assert "主要備註" in _output_cell(result_main, 2, 19)
+    # 預設值維持原本行為（吃明細行「備忘錄」）
+    result_default = shipping_convert_rows([header, row], MODE_ORDER, TEMPLATE_PATH)
+    assert "明細行備註" in _output_cell(result_default, 2, 19)
+
+
+def test_memo_line_equal_to_product_name_is_noise():
+    """2026-08 新版報表明細行備忘錄=品名（NetSuite 回填），要過濾掉不進備註。"""
+    header = _E2E_HEADER + ["備忘錄", "備忘錄 (主要)"]
+    row = _e2e_row("2027-05-01", 10) + ["品名A", "真正的備註"]  # 備忘錄 = 項目名稱
+    result = shipping_convert_rows(
+        [header, row], MODE_ORDER, TEMPLATE_PATH, memo_source=MEMO_SOURCE_LINE
+    )
+    note = _output_cell(result, 2, 19)
+    assert "品名A" not in note
+    assert note.endswith("|")  # 溫馨提醒段為空
+    assert any("與品名相同" in w for w in result.warnings)
+    # 主要備忘錄不受影響
+    result_main = shipping_convert_rows(
+        [header, row], MODE_ORDER, TEMPLATE_PATH, memo_source=MEMO_SOURCE_MAIN
+    )
+    assert "真正的備註" in _output_cell(result_main, 2, 19)
+    assert not any("與品名相同" in w for w in result_main.warnings)
+
+
+def test_memo_source_falls_back_with_warning():
+    """選擇的備忘錄欄不存在時，退回另一欄並提醒。"""
+    header = _E2E_HEADER + ["備忘錄 (主要)"]
+    row = _e2e_row("2027-05-01", 10) + ["主要備註"]
+    result = shipping_convert_rows(
+        [header, row], MODE_ORDER, TEMPLATE_PATH, memo_source=MEMO_SOURCE_LINE
+    )
+    assert "主要備註" in _output_cell(result, 2, 19)
+    assert any("備忘錄" in w and "改用" in w for w in result.warnings)
+
+    m00_result = m00_convert_rows(
+        [header, row], MODE_ORDER, M00_TEMPLATE_PATH, memo_source=MEMO_SOURCE_LINE
+    )
+    assert any("改用" in w for w in m00_result.warnings)
 
 
 # ------------------------------------------------------------------ 虛擬倉（輸出第 30 欄）

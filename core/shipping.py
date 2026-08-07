@@ -9,6 +9,9 @@
   4. 虛擬倉（AD 欄）：來源報表有倉別/地點欄時逐列帶出 G 開頭代碼；
      沒有該欄（或該列空白）時，料號 9 開頭（陳列/宣傳品，存 G90 倉）
      輸出 G90 並附警告，其餘沿用範本預設值（G10）。
+  5. 備忘錄來源可選「明細行（備忘錄）」或「主要（備忘錄 (主要)）」；
+     明細行備忘錄內容與該列品名相同時（2026-08 新版報表 NetSuite
+     會回填品名）視為系統雜訊，不併入備註。
 """
 from __future__ import annotations
 
@@ -38,6 +41,16 @@ OUTPUT_COLUMN_COUNT = 36
 MODE_ORDER = "order"       # 銷售訂單未出貨明細 (360)
 MODE_TRANSFER = "transfer"  # 調撥單未出貨明細 (162)
 
+# 備忘錄（DR_溫馨提醒）來源欄選項：NetSuite 報表同時有明細行的「備忘錄」
+# 與主要層級的「備忘錄 (主要)」時，由使用者決定要吃哪一欄。
+MEMO_SOURCE_LINE = "line"   # 明細行「備忘錄」
+MEMO_SOURCE_MAIN = "main"   # 主要「備忘錄 (主要)」
+
+_MEMO_ALIASES = {
+    MEMO_SOURCE_LINE: ("備忘錄", "備忘錄 (主要)"),
+    MEMO_SOURCE_MAIN: ("備忘錄 (主要)", "備忘錄"),
+}
+
 # 每個標準欄名可對應多個候選別名，依序取第一個存在的欄
 #（2026-07 NetSuite 報表改版：項目名稱→顯示名稱、備忘錄→備忘錄 (主要)）。
 _ARRIVAL_ALIASES = ("預計到貨日期", "預計到貨日", "DR_預計到貨日", "預計送達日期", "預計送達日")
@@ -47,14 +60,12 @@ _ALIASES = {
     MODE_ORDER: {
         "項目名稱": ("顯示名稱",),
         "序號/批號": ("交易序號/批號",),
-        "DR_溫馨提醒": ("備忘錄", "備忘錄 (主要)"),
         "DR_預計到貨日期": _ARRIVAL_ALIASES,
         "DR_預計到貨時段": _ARRIVAL_SLOT_ALIASES,
     },
     MODE_TRANSFER: {
         "項目名稱": ("顯示名稱",),
         "序號/批號": ("交易序號/批號",),
-        "DR_溫馨提醒": ("備忘錄", "備忘錄 (主要)"),
         "DR_預計到貨日期": _ARRIVAL_ALIASES,
         "DR_預計到貨時段": _ARRIVAL_SLOT_ALIASES,
         "出貨客戶": ("目標地點",),
@@ -128,18 +139,24 @@ class ConvertError(ValueError):
     pass
 
 
-def convert(data: bytes, filename: str, mode: str, template_path: Path) -> ConvertResult:
+def convert(
+    data: bytes, filename: str, mode: str, template_path: Path,
+    memo_source: str = MEMO_SOURCE_LINE,
+) -> ConvertResult:
     rows = first_sheet(read_workbook(data, filename))
-    return convert_rows(rows, mode, template_path)
+    return convert_rows(rows, mode, template_path, memo_source=memo_source)
 
 
-def convert_rows(rows: list[list[object]], mode: str, template_path: Path) -> ConvertResult:
+def convert_rows(
+    rows: list[list[object]], mode: str, template_path: Path,
+    memo_source: str = MEMO_SOURCE_LINE,
+) -> ConvertResult:
     """轉換已讀取的表格資料（header 列 + 資料列），供檔案上傳與 NetSuite 直接抓取共用。"""
     if not rows:
         raise ConvertError("來源工作表沒有可轉換的表格資料。")
 
     headers = build_header_map(rows[0])
-    alias_notes = _apply_aliases(headers, mode)
+    alias_notes = _apply_aliases(headers, mode, memo_source)
     missing = [h for h in _REQUIRED_HEADERS[mode] if h.casefold() not in headers]
     if missing:
         raise ConvertError("來源檔缺少必要欄位：\n" + "\n".join(f"- {h}" for h in missing))
@@ -175,8 +192,10 @@ def convert_rows(rows: list[list[object]], mode: str, template_path: Path) -> Co
 # ------------------------------------------------------------------ 讀表輔助
 
 
-def _apply_aliases(headers: dict[str, int], mode: str) -> list[str]:
-    """套用別名對照；回傳關鍵字比對備援產生的提醒訊息（給呼叫端併入警告）。"""
+def _apply_aliases(
+    headers: dict[str, int], mode: str, memo_source: str = MEMO_SOURCE_LINE,
+) -> list[str]:
+    """套用別名對照；回傳別名/關鍵字比對備援產生的提醒訊息（給呼叫端併入警告）。"""
     for canonical, aliases in _ALIASES[mode].items():
         key = canonical.casefold()
         if key in headers:
@@ -186,7 +205,32 @@ def _apply_aliases(headers: dict[str, int], mode: str) -> list[str]:
             if alias_key in headers:
                 headers[key] = headers[alias_key]
                 break
-    return _match_arrival_by_keyword(headers)
+    return _apply_memo_source(headers, memo_source) + _match_arrival_by_keyword(headers)
+
+
+def _apply_memo_source(headers: dict[str, int], memo_source: str) -> list[str]:
+    """依使用者選擇綁定備忘錄來源欄（來源檔本身有 DR_溫馨提醒 欄時以該欄為準）。
+
+    選擇的欄不存在但另一欄存在時，退回另一欄並回傳提醒訊息。
+    """
+    candidates = _MEMO_ALIASES.get(memo_source)
+    if candidates is None:
+        raise ConvertError(f"未知的備忘錄來源選項：{memo_source}")
+    key = "DR_溫馨提醒".casefold()
+    if key in headers:
+        return []
+    preferred = candidates[0]
+    for alias in candidates:
+        alias_key = alias.casefold()
+        if alias_key in headers:
+            headers[key] = headers[alias_key]
+            if alias != preferred:
+                return [
+                    f"來源檔沒有「{preferred}」欄，備忘錄改用「{alias}」欄，"
+                    "請確認備忘錄來源選擇是否正確。"
+                ]
+            return []
+    return []
 
 
 # 關鍵字比對備援要排除語意不同的欄位（實際到貨日、上次到貨日等），
@@ -283,6 +327,27 @@ def _material_and_name(dr_material: object, item_text: object) -> tuple[str, str
     elif matched:
         return matched.group(1), matched.group(2).strip()
     return fallback.strip(), ""
+
+
+_REMINDER_NOISE_NOTE = (
+    "部分明細列的備忘錄內容與品名相同（NetSuite 系統帶入的預設值），未併入備註；"
+    "如需訂單備註請將備忘錄來源改選「主要備忘錄」。"
+)
+
+
+def _reminder_text(row: list, headers: dict[str, int]) -> tuple[str, bool]:
+    """讀該列備忘錄（DR_溫馨提醒）欄，回傳 (內容, 是否為雜訊)。
+
+    2026-08 新版報表的明細行「備忘錄」被 NetSuite 回填成品名，
+    與該列項目名稱相同時視為雜訊忽略，避免備註被一長串品名塞爆。
+    """
+    text = normalize_text(_cell(row, headers, "DR_溫馨提醒"))
+    if not text:
+        return "", False
+    name = normalize_text(_cell(row, headers, "項目名稱"))
+    if name and text == name:
+        return "", True
+    return text, False
 
 
 BATCH_STATUS_OK = "批號賦予成功"
@@ -491,7 +556,10 @@ def _add_row_to_shipment(
 
     _add_distinct(shipment.times, normalize_text(_cell(row, headers, "DR_預計到貨時段")))
     _add_distinct(shipment.purchase_orders, normalize_text(_cell(row, headers, "客戶採購單編號")))
-    _add_distinct(shipment.reminders, normalize_text(_cell(row, headers, "DR_溫馨提醒")))
+    reminder, reminder_is_noise = _reminder_text(row, headers)
+    _add_distinct(shipment.reminders, reminder)
+    if reminder_is_noise:
+        _add_distinct(warnings, _REMINDER_NOISE_NOTE)
 
     batch_value = normalize_text(_cell(row, headers, "序號/批號"))
     item_text = normalize_text(_cell(row, headers, "項目"))

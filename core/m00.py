@@ -21,8 +21,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .shipping import (
+    MEMO_SOURCE_LINE,
     MODE_ORDER,
     MODE_TRANSFER,
+    _REMINDER_NOISE_NOTE,
     _REQUIRED_HEADERS,
     _add_distinct,
     _apply_aliases,
@@ -33,6 +35,7 @@ from .shipping import (
     _normalize_expiry,
     _phone_to_text,
     _positive_quantity,
+    _reminder_text,
     _split_postal,
 )
 from .xlio import build_header_map, first_sheet, is_blank_row, normalize_text, read_workbook
@@ -84,18 +87,24 @@ class M00Result:
     problem_rows: list
 
 
-def convert(data: bytes, filename: str, mode: str, template_path: Path) -> M00Result:
+def convert(
+    data: bytes, filename: str, mode: str, template_path: Path,
+    memo_source: str = MEMO_SOURCE_LINE,
+) -> M00Result:
     rows = first_sheet(read_workbook(data, filename))
-    return convert_rows(rows, mode, template_path)
+    return convert_rows(rows, mode, template_path, memo_source=memo_source)
 
 
-def convert_rows(rows: list[list[object]], mode: str, template_path: Path) -> M00Result:
+def convert_rows(
+    rows: list[list[object]], mode: str, template_path: Path,
+    memo_source: str = MEMO_SOURCE_LINE,
+) -> M00Result:
     """轉換已讀取的表格資料（header 列 + 資料列），供檔案上傳與 NetSuite 直接抓取共用。"""
     if not rows:
         raise M00Error("來源工作表沒有可轉換的表格資料。")
 
     headers = build_header_map(rows[0])
-    alias_notes = _apply_aliases(headers, mode)
+    alias_notes = _apply_aliases(headers, mode, memo_source)
     missing = [h for h in _REQUIRED_HEADERS[mode] if h.casefold() not in headers]
     if missing:
         raise M00Error("來源檔缺少必要欄位：\n" + "\n".join(f"- {h}" for h in missing))
@@ -174,7 +183,10 @@ def _build_groups(rows: list, headers: dict, mode: str) -> dict:
                 f"預計到貨時段「{slot_text}」無法對應（早(9-12)/中(12-17)/晚(17-20)），"
                 f"將以預設「{_DEFAULT_TIME_SLOT}」輸出希望配送時段。",
             )
-        _add_distinct(group.reminders, normalize_text(_cell(row, headers, "DR_溫馨提醒")))
+        reminder, reminder_is_noise = _reminder_text(row, headers)
+        _add_distinct(group.reminders, reminder)
+        if reminder_is_noise:
+            _add_distinct(warnings, _REMINDER_NOISE_NOTE)
 
         batch_value = normalize_text(_cell(row, headers, "序號/批號"))
         item_text = normalize_text(_cell(row, headers, "項目"))

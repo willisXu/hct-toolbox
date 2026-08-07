@@ -39,6 +39,37 @@ BUNDLE_MAP_PATH = BASE_DIR / "mappings" / "組合對照表.xlsx"
 FORMAT_HCT = "HCT 銷貨報表格式"
 FORMAT_M00 = "M00 出貨格式"
 
+# 備忘錄來源選項：顯示名稱 → shipping 模組的 memo_source 常數
+MEMO_LINE_LABEL = "明細行備忘錄"
+MEMO_MAIN_LABEL = "主要備忘錄"
+MEMO_SOURCE_MAP = {
+    MEMO_LINE_LABEL: shipping.MEMO_SOURCE_LINE,
+    MEMO_MAIN_LABEL: shipping.MEMO_SOURCE_MAIN,
+}
+
+
+def _memo_source_radio(key: str) -> str:
+    """備忘錄來源選擇（回傳 shipping 的 memo_source 常數）。"""
+    st.markdown("**備忘錄來源**")
+    label = st.radio(
+        "備忘錄來源",
+        [MEMO_LINE_LABEL, MEMO_MAIN_LABEL],
+        captions=[
+            "吃明細行的「備忘錄」欄",
+            "吃主要層級的「備忘錄 (主要)」欄",
+        ],
+        key=key,
+        horizontal=True,
+        label_visibility="collapsed",
+        help=(
+            "來源報表本身有「DR_溫馨提醒」欄時，以該欄為準，此選項不生效。\n\n"
+            "新版報表的明細行「備忘錄」常被系統回填成品名，"
+            "與品名相同的內容會自動忽略不進備註；訂單備註在"
+            "「備忘錄 (主要)」時請改選主要備忘錄。"
+        ),
+    )
+    return MEMO_SOURCE_MAP[label]
+
 EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 st.set_page_config(page_title="HCT 工具箱", page_icon="📦", layout="wide")
@@ -64,7 +95,7 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
     st.markdown(
         f"1. 從 NetSuite 匯出 **{source_hint}**（.xls / .xlsx 皆可）\n"
         "2. 把檔案拖進下方框框\n"
-        "3. 選擇輸出格式，按「開始轉換」，完成後點「下載結果」"
+        "3. 選擇輸出格式與備忘錄來源，按「開始轉換」，完成後點「下載結果」"
     )
     uploaded = st.file_uploader(
         f"選擇 {source_hint}", type=["xls", "xlsx", "xlsm"], key=f"{key_prefix}_file"
@@ -81,15 +112,22 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
         horizontal=True,
         label_visibility="collapsed",
     )
+    memo_source = _memo_source_radio(f"{key_prefix}_memo_source")
     state_key = f"{key_prefix}_result"
 
     if uploaded is not None and st.button("🚀 開始轉換", key=f"{key_prefix}_run", type="primary"):
         try:
             with st.spinner("轉換中..."):
                 if output_format == FORMAT_M00:
-                    result = m00_mod.convert(uploaded.getvalue(), uploaded.name, mode, M00_TEMPLATE_PATH)
+                    result = m00_mod.convert(
+                        uploaded.getvalue(), uploaded.name, mode, M00_TEMPLATE_PATH,
+                        memo_source=memo_source,
+                    )
                 else:
-                    result = shipping.convert(uploaded.getvalue(), uploaded.name, mode, TEMPLATE_PATH)
+                    result = shipping.convert(
+                        uploaded.getvalue(), uploaded.name, mode, TEMPLATE_PATH,
+                        memo_source=memo_source,
+                    )
         except Exception as exc:  # noqa: BLE001 - 給使用者看得懂的訊息
             st.session_state.pop(state_key, None)
             _show_error(exc)
@@ -182,7 +220,7 @@ with tab_netsuite:
     st.markdown(
         "1. 選擇要抓取的 saved search，按「抓取資料」\n"
         "2. 抓回後可在表格勾選要轉換的列（預設全選；也可用「全選」「取消全選」批量調整）\n"
-        "3. 選擇輸出格式，按「開始轉換」，完成後點「下載結果」"
+        "3. 選擇輸出格式與備忘錄來源，按「開始轉換」，完成後點「下載結果」"
     )
     searches = _load_saved_searches()
     if not searches:
@@ -271,6 +309,7 @@ with tab_netsuite:
                 horizontal=True,
                 label_visibility="collapsed",
             )
+            ns_memo_source = _memo_source_radio("ns_memo_source")
 
             if st.button("🚀 開始轉換", key="ns_run", type="primary"):
                 selected = edited[edited["選取"]].drop(columns=["選取"])
@@ -281,9 +320,15 @@ with tab_netsuite:
                     try:
                         with st.spinner("轉換中..."):
                             if ns_format == FORMAT_M00:
-                                result = m00_mod.convert_rows(rows_for_convert, ns_mode, M00_TEMPLATE_PATH)
+                                result = m00_mod.convert_rows(
+                                    rows_for_convert, ns_mode, M00_TEMPLATE_PATH,
+                                    memo_source=ns_memo_source,
+                                )
                             else:
-                                result = shipping.convert_rows(rows_for_convert, ns_mode, TEMPLATE_PATH)
+                                result = shipping.convert_rows(
+                                    rows_for_convert, ns_mode, TEMPLATE_PATH,
+                                    memo_source=ns_memo_source,
+                                )
                     except Exception as exc:
                         st.session_state.pop("ns_result", None)
                         _show_error(exc)
