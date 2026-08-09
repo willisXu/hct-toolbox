@@ -159,6 +159,57 @@ def test_inventory_contract_reconcile_against_ns293():
     assert "僅 代工廠 存在" in result.statuses
 
 
+def test_inventory_m00_reconcile_sums_qty_plus_reserved():
+    """M00 庫存詳情 × NetSuite：庫存量＝數量＋組合保留，整份視為 M00 倉。"""
+    m00 = _spreadsheetml([
+        ["SKU", "國際條碼", "商品名稱", "有效日期", "商品狀態", "狀態", "數量", "組合保留", "批號"],
+        ["115101040013", "471", "面膜4入", "2029-01-01", "良好", "可以出倉", "377", "0", "L1"],
+        ["115101040013", "471", "面膜4入", "2029-01-01", "良好", "準備出倉", "25", "4", "L1"],
+        ["101051190015", "471", "精華乳", "2027-06-01", "NG", "可以出倉", "10", "2", "L2"],
+    ])
+    ns293 = _spreadsheetml([
+        ["地點", "到期日", "項目", "庫存數 總和"],
+        ["M00_電商倉", "2029/1/1", "115101040013_X", "406"],
+        ["G10", "", "999000000001_X", "5"],
+    ])
+    assert inventory.detect_source(m00, "m00.xlsx") == inventory.SYSTEM_M00
+
+    result = inventory.reconcile(m00, "m00.xlsx", ns293, "ns.xls")
+    assert result.ext_label == inventory.SYSTEM_M00
+    assert result.output_name.startswith("M00庫存核對結果_")
+    assert result.ns_stats.excluded_rows == 1   # 非 M00 倉（G10）
+    assert result.hct_stats.excluded_rows == 0
+    by_item = {r["料號"]: r for r in result.item_rows}
+    assert by_item["115101040013"]["M00 庫存數量"] == 406   # 377+0+25+4
+    assert by_item["115101040013"]["狀態"] == inventory.STATUS_MATCH
+    assert by_item["101051190015"]["M00 庫存數量"] == 12    # 10+2
+    assert by_item["101051190015"]["狀態"] == "僅 M00 存在"
+    assert "僅 M00 存在" in result.statuses
+
+
+def test_inventory_m00_location_variants_and_dash_expiry():
+    """NetSuite 倉別 M00倉/M001（無底線）要收斂成 M00 鍵；全形破折號＝無到期日。"""
+    m00 = _spreadsheetml([
+        ["SKU", "商品名稱", "有效日期", "數量", "組合保留", "批號"],
+        ["115101040013", "面膜4入", "2029-01-01", "100", "0", "L1"],
+        ["888000000001", "贈品帆布袋", "—", "30", "5", ""],  # 全形破折號＝無到期日
+    ])
+    ns293 = _spreadsheetml([
+        ["地點", "到期日", "項目", "庫存數 總和"],
+        ["M00倉", "2029/1/1", "115101040013_X", "100"],   # 無底線的 M00 開頭倉別
+        ["M001", "", "888000000001_X", "35"],
+    ])
+    result = inventory.reconcile(m00, "m00.xlsx", ns293, "ns.xls")
+    assert result.hct_stats.anomaly_rows == 0  # 破折號不能被當成日期異常排除
+    assert result.ns_stats.excluded_rows == 0
+    by_item = {r["料號"]: r for r in result.item_rows}
+    assert len(by_item) == 2  # 兩邊鍵收斂成 M00，不能拆成僅單邊存在的假差異
+    assert by_item["115101040013"]["狀態"] == inventory.STATUS_MATCH
+    assert by_item["888000000001"]["M00 庫存數量"] == 35  # 30+5
+    assert by_item["888000000001"]["狀態"] == inventory.STATUS_MATCH
+    assert all(r["倉別"] == "M00" for r in result.item_rows)
+
+
 def test_inventory_hct_reconcile_output_unchanged():
     """原本的 HCT × NetSuite 流程不受新格式影響(欄名、檔名、狀態清單)。"""
     hct = _spreadsheetml([

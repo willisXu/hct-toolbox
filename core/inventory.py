@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
-"""HCT／代工廠 × NetSuite 庫存核對(由 VBA modInventory* 模組移植)。
+"""HCT／代工廠／M00 × NetSuite 庫存核對(由 VBA modInventory* 模組移植)。
 
   - NetSuite 報表欄位：地點、到期日、DR_料號、項目計數 總和、數量 總和
   - HCT 報表欄位：儲區類別、有效日期、客戶產品編號、可出數量、庫存數量
   - 代工廠報表欄位：庫存日期、倉別、品號、品名、批號、庫存數量
+  - M00 報表(電商物流 InventorySummaryReport)：取「庫存詳情」分頁，
+    欄位 SKU、商品名稱、有效日期、數量、組合保留、批號；報表沒有倉別欄，
+    一律視為 M00 倉，庫存量＝數量＋組合保留(單品數量庫存，已用
+    「庫存總表-單品」的庫存總數驗證)，同時當作可用量與總庫存量。
   - HCT 對帳只核對 G00/G10/G30/G40/G80/G90 倉；代工廠對帳只核對 D 開頭
-    代工廠倉(D01 凱芬妮、D03 詠麗…)，其他倉別與「合計／總計」列列入排除數。
+    代工廠倉(D01 凱芬妮、D03 詠麗…)，「合計／總計」小計列列入排除數；
+    M00 對帳只核對 M00 開頭倉別(各 M00 開頭代碼收斂成 M00 核對鍵)。
+    非核對範圍的倉別一律列入排除數。
   - 代工廠報表只有一個「庫存數量」欄，同時當作可用量與總庫存量(同 293 格式)。
   - 以「倉別+料號+到期日」做日期明細核對，另以「倉別+料號」做料號彙總核對。
-  - 差異基準：HCT／代工廠－NetSuite。
+  - 差異基準：HCT／代工廠／M00－NetSuite。
 """
 from __future__ import annotations
 
@@ -20,9 +26,11 @@ from .xlio import is_excel_error_text, read_workbook, try_parse_date
 
 SYSTEM_HCT = "HCT"
 SYSTEM_CONTRACT = "代工廠"
+SYSTEM_M00 = "M00"
 SYSTEM_NETSUITE = "NetSuite"
 APPROVED_LOCATIONS = {"G00", "G10", "G30", "G40", "G80", "G90"}
 CONTRACT_LOCATION_PREFIX = "D"
+M00_LOCATION_PREFIX = "M00"
 
 STATUS_MATCH = "完全一致"
 STATUS_AVAILABLE_DIFF = "僅可用量差異"
@@ -37,7 +45,7 @@ def _ext_only_status(ext_label: str) -> str:
 
 
 def status_order(ext_label: str = SYSTEM_HCT) -> list[str]:
-    """依外部系統(HCT／代工廠)產生狀態清單；「僅 X 存在」隨系統改名。"""
+    """依外部系統(HCT／代工廠／M00)產生狀態清單；「僅 X 存在」隨系統改名。"""
     return [
         STATUS_MATCH, STATUS_AVAILABLE_DIFF, STATUS_TOTAL_DIFF,
         STATUS_BOTH_DIFF, _ext_only_status(ext_label), STATUS_NS_ONLY,
@@ -57,6 +65,13 @@ _HCT_HEADERS = ["客戶產品編號", "有效日期", "儲區類別", "可出數
 # 代工廠庫存核對報表：只有一個「庫存數量」欄，同時當作可用量與總庫存量；
 # 「批號」放到期日欄位(目前多為空白＝無到期日)，「合計／總計」小計列會被排除。
 _CONTRACT_HEADERS = ["庫存日期", "倉別", "品號", "品名", "庫存數量"]
+# M00 電商物流 InventorySummaryReport 的「庫存詳情」分頁：沒有倉別欄
+# (一律視為 M00 倉)，庫存量＝數量＋組合保留。這組欄位只有庫存詳情分頁
+# 同時具備，不會誤中同檔案的庫存總表／待入庫清單等其他分頁。
+_M00_HEADERS = ["SKU", "商品名稱", "有效日期", "數量", "組合保留", "批號"]
+# M00 報表「有效日期」的無到期日符號（贈品/週邊等）：涵蓋半形/全形各種
+# 破折號寫法，只認 ASCII 的 "-" 會讓其他寫法的列被誤判成日期異常整列排除。
+_M00_NO_EXPIRY_MARKS = {"-", "—", "–", "‑", "－"}
 
 SYSTEM_NETSUITE_293 = "NetSuite293"
 SYSTEM_NETSUITE_663 = "NetSuite663"
@@ -184,6 +199,8 @@ def detect_source(data: bytes, filename: str) -> str:
         matches.append(SYSTEM_HCT)
     if _find_matching_sheet(book, _CONTRACT_HEADERS):
         matches.append(SYSTEM_CONTRACT)
+    if _find_matching_sheet(book, _M00_HEADERS):
+        matches.append(SYSTEM_M00)
     if len(matches) > 1:
         raise InventoryError(
             f"{filename}:同時符合多種報表格式（{'、'.join(matches)}），無法自動判斷，"
@@ -194,12 +211,18 @@ def detect_source(data: bytes, filename: str) -> str:
 
 def _import_source(data: bytes, filename: str, system: str,
                    detail: dict, item_totals: dict, anomalies: list,
-                   stats: SourceStats, location_ok) -> None:
+                   stats: SourceStats, location_ok, location_key=None) -> None:
+    """location_key：通過 location_ok 的倉別轉成核對鍵（預設原樣）。
+    M00 對帳用它把 NetSuite 側各種 M00 開頭代碼（M00倉、M001…）收斂成
+    「M00」，跟 M00 報表側寫死的倉別對得上；否則前綴過濾放進來的列
+    會因為鍵不同而變成假的「僅單邊存在」差異。"""
     book = read_workbook(data, filename)
     if system == SYSTEM_HCT:
         required = _HCT_HEADERS
     elif system == SYSTEM_CONTRACT:
         required = _CONTRACT_HEADERS
+    elif system == SYSTEM_M00:
+        required = _M00_HEADERS
     elif system == SYSTEM_NETSUITE_293:
         required = _NS293_HEADERS
     elif system == SYSTEM_NETSUITE_663:
@@ -229,6 +252,14 @@ def _import_source(data: bytes, filename: str, system: str,
         available_col = total_col = col("庫存數量")
         desc_col = col("品名")
         field_names = ("倉別", "品號", "批號", "庫存數量", "庫存數量")
+    elif system == SYSTEM_M00:
+        # 報表沒有倉別欄，一律視為 M00 倉；庫存量＝數量(J)＋組合保留(K)，
+        # 兩欄分開解析後於下方相加，同時當作可用量與總庫存量。
+        location_col, item_col = None, col("SKU")
+        expiry_col = col("有效日期")
+        available_col, total_col = col("數量"), col("組合保留")
+        desc_col = col("商品名稱")
+        field_names = ("倉別", "SKU", "有效日期", "數量", "組合保留")
     elif system == SYSTEM_NETSUITE_293:
         location_col, item_col = col("地點"), col("項目")
         expiry_col = col("到期日")
@@ -281,13 +312,18 @@ def _import_source(data: bytes, filename: str, system: str,
                 "異常說明": issue,
             })
 
-        location = _normalize_location(get(row, location_col))
+        if system == SYSTEM_M00:
+            location = M00_LOCATION_PREFIX  # 報表無倉別欄，整份都是 M00 倉
+        else:
+            location = _normalize_location(get(row, location_col))
         if not location:
             anomaly(field_names[0], get(row, location_col), "倉別不可空白")
             has_issue = True
         elif not location_ok(location):
             stats.excluded_rows += 1
             continue
+        elif location_key is not None:
+            location = location_key(location)
 
         item_code = _normalize_item(get(row, item_col))
         if strip_item_suffix and "_" in item_code:
@@ -299,7 +335,10 @@ def _import_source(data: bytes, filename: str, system: str,
             anomaly(field_names[1], get(row, item_col), "料號不可空白")
             has_issue = True
 
-        expiry_key, expiry_ok = _normalize_date(get(row, expiry_col))
+        expiry_value = get(row, expiry_col)
+        if system == SYSTEM_M00 and str(expiry_value or "").strip() in _M00_NO_EXPIRY_MARKS:
+            expiry_value = None  # M00 報表用「-」（或各式破折號）表示無到期日
+        expiry_key, expiry_ok = _normalize_date(expiry_value)
         if not expiry_ok:
             anomaly(field_names[2], get(row, expiry_col), "非空日期無法辨識")
             has_issue = True
@@ -317,6 +356,10 @@ def _import_source(data: bytes, filename: str, system: str,
         if has_issue:
             stats.anomaly_rows += 1
             continue
+
+        if system == SYSTEM_M00:
+            # 單品數量庫存＝數量＋組合保留，同時當作可用量與總庫存量。
+            available = total = available + total
 
         description = _normalize_item(get(row, desc_col)) if desc_col is not None else ""
         _add_aggregate(detail, (location, item_code, expiry_key), available, total, description)
@@ -402,14 +445,14 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
     first_system = detect_source(ns_data, ns_name)
     if not first_system:
         raise InventoryError(
-            f"無法辨識檔案:{ns_name}(找不到 NetSuite、HCT 或代工廠報表的必要欄位)")
+            f"無法辨識檔案:{ns_name}(找不到 NetSuite、HCT、代工廠或 M00 報表的必要欄位)")
     second_system = detect_source(hct_data, hct_name)
     if not second_system:
         raise InventoryError(
-            f"無法辨識檔案:{hct_name}(找不到 NetSuite、HCT 或代工廠報表的必要欄位)")
+            f"無法辨識檔案:{hct_name}(找不到 NetSuite、HCT、代工廠或 M00 報表的必要欄位)")
 
     ns_variants = (SYSTEM_NETSUITE, SYSTEM_NETSUITE_293, SYSTEM_NETSUITE_663)
-    ext_variants = (SYSTEM_HCT, SYSTEM_CONTRACT)
+    ext_variants = (SYSTEM_HCT, SYSTEM_CONTRACT, SYSTEM_M00)
     if first_system in ext_variants and second_system in ns_variants:
         ns_data, hct_data = hct_data, ns_data
         ns_name, hct_name = hct_name, ns_name
@@ -418,9 +461,22 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
         ns_system, ext_system = first_system, second_system
     else:
         raise InventoryError(
-            "兩份檔案無法配成一份 NetSuite 與一份 HCT(或代工廠)報表，請重新選取。")
+            "兩份檔案無法配成一份 NetSuite 與一份 HCT(或代工廠、M00)報表，請重新選取。")
 
-    if ext_system == SYSTEM_CONTRACT:
+    location_key = None
+    if ext_system == SYSTEM_M00:
+        # M00 對帳只看 M00 開頭倉別(NetSuite 側；M00 報表本身整份視為 M00 倉)，
+        # 並把通過過濾的倉別一律收斂成「M00」當核對鍵。
+        def location_ok(location: str) -> bool:
+            return location.startswith(M00_LOCATION_PREFIX)
+
+        def location_key(_location: str) -> str:
+            return M00_LOCATION_PREFIX
+        ext_label = SYSTEM_M00
+        scope_text = f"{M00_LOCATION_PREFIX} 開頭電商物流倉"
+        excluded_label = "排除非 M00 倉筆數"
+        output_prefix = "M00庫存核對結果"
+    elif ext_system == SYSTEM_CONTRACT:
         # 代工廠對帳只看 D 開頭代工廠倉(兩邊都套同一條規則)。
         def location_ok(location: str) -> bool:
             return location.startswith(CONTRACT_LOCATION_PREFIX)
@@ -445,9 +501,9 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
     ns_stats = SourceStats(file_name=ns_name)
 
     _import_source(ns_data, ns_name, ns_system, ns_detail, ns_items, anomalies, ns_stats,
-                   location_ok)
+                   location_ok, location_key)
     _import_source(hct_data, hct_name, ext_system, hct_detail, hct_items, anomalies, hct_stats,
-                   location_ok)
+                   location_ok, location_key)
 
     detail_rows = _build_reconciliation(hct_detail, ns_detail, include_expiry=True,
                                         ext_label=ext_label)
