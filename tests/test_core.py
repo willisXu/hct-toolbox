@@ -25,6 +25,7 @@ from core.return_compare import _normalize_expiry as ret_normalize_expiry, _stri
 from core.shipping import (
     MEMO_SOURCE_LINE,
     MEMO_SOURCE_MAIN,
+    MERGE_BY_PURCHASE_ORDER,
     MODE_ORDER,
     _match_arrival_by_keyword,
     _normalize_arrival,
@@ -261,6 +262,72 @@ def test_e2e_unknown_time_slot_warns():
     rows = [_E2E_HEADER, _e2e_row("2027-05-01", 10, slot="晚（17-20）")]
     m00_result = m00_convert_rows(rows, MODE_ORDER, M00_TEMPLATE_PATH)
     assert any("無法對應" in w for w in m00_result.warnings)
+
+
+# ------------------------------------------------------------------ 採購單合併
+
+
+def _po_row(doc: str, order_type: str, material: str = "SKU001",
+            address: str = "10041台北市中正區路1號") -> list:
+    return [
+        "1", doc, order_type, "2026-07-01", f"{material}_X", "品名A", material,
+        "2027-05-01", "客戶A", 10, "門市A", "聯絡人", "0912345678",
+        address, "2026-07-30", "早(9-12)",
+    ]
+
+
+_PO_HEADER = _E2E_HEADER + ["客戶採購單編號"]
+
+
+def test_merge_by_po_merges_regardless_of_order_type():
+    """同採購單編號的訂單合併成一張送貨單，不看訂單類型（全備品出貨也合併）。"""
+    rows = [
+        _PO_HEADER,
+        _po_row("SO-1", "備品出貨") + ["PO-100"],
+        _po_row("SO-2", "備品出貨", material="SKU002") + ["PO-100"],
+        _po_row("SO-3", "備品出貨") + ["PO-200"],
+    ]
+    result = shipping_convert_rows(
+        rows, MODE_ORDER, TEMPLATE_PATH, merge_by=MERGE_BY_PURCHASE_ORDER
+    )
+    assert result.shipments == 2
+    assert result.merged_groups == 1
+    # 合併單的送貨單號/訂單編號列出兩張 SO（沒有一般銷售訂單也不能空白）
+    assert _output_cell(result, 2, 1) == "SO-1、SO-2"
+    assert _output_cell(result, 2, 2) == "SO-1、SO-2"
+    # 原規則下同樣資料完全不合併（無一般銷售訂單）
+    baseline = shipping_convert_rows(rows, MODE_ORDER, TEMPLATE_PATH)
+    assert baseline.shipments == 3
+    assert baseline.merged_groups == 0
+
+
+def test_merge_by_po_blank_po_stays_separate_and_warns():
+    rows = [
+        _PO_HEADER,
+        _po_row("SO-1", "備品出貨") + [""],
+        _po_row("SO-2", "備品出貨", material="SKU002") + [""],
+    ]
+    result = shipping_convert_rows(
+        rows, MODE_ORDER, TEMPLATE_PATH, merge_by=MERGE_BY_PURCHASE_ORDER
+    )
+    assert result.shipments == 2
+    assert any("客戶採購單編號空白" in w for w in result.warnings)
+
+
+def test_merge_by_po_warns_on_inconsistent_recipient():
+    rows = [
+        _PO_HEADER,
+        _po_row("SO-1", "備品出貨") + ["PO-100"],
+        _po_row("SO-2", "備品出貨", material="SKU002",
+                address="20041基隆市另一個地址2號") + ["PO-100"],
+    ]
+    result = shipping_convert_rows(
+        rows, MODE_ORDER, TEMPLATE_PATH, merge_by=MERGE_BY_PURCHASE_ORDER
+    )
+    assert result.shipments == 1
+    assert any("不一致" in w and "PO-100" in w for w in result.warnings)
+    # 輸出以第一筆為準
+    assert "台北市" in _output_cell(result, 2, 12)
 
 
 # ------------------------------------------------------------------ 備忘錄來源

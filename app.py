@@ -48,6 +48,33 @@ MEMO_SOURCE_MAP = {
 }
 
 
+# 合併方式選項：顯示名稱 → shipping 模組的 merge_by 常數
+MERGE_RECIPIENT_LABEL = "收件條件（原規則）"
+MERGE_PO_LABEL = "客戶採購單編號"
+MERGE_BY_MAP = {
+    MERGE_RECIPIENT_LABEL: shipping.MERGE_BY_RECIPIENT,
+    MERGE_PO_LABEL: shipping.MERGE_BY_PURCHASE_ORDER,
+}
+
+
+def _merge_by_radio(key: str) -> str:
+    """跨單合併方式選擇（回傳 shipping 的 merge_by 常數）。僅 HCT 銷貨報表格式有效。"""
+    st.markdown("**合併方式**（僅 HCT 銷貨報表格式有效，M00 一律不合併）")
+    label = st.radio(
+        "合併方式",
+        [MERGE_RECIPIENT_LABEL, MERGE_PO_LABEL],
+        captions=[
+            "預計到貨日＋出貨客戶＋門市＋地址相同，且訂單類型 ≥2 種並含一般銷售訂單才合併",
+            "客戶採購單編號相同即合併為一張送貨單（編號空白的不合併）",
+        ],
+        key=key,
+        horizontal=True,
+        label_visibility="collapsed",
+        help="以採購單合併時不看訂單類型；合併群組內收件資訊不一致會警告並以第一筆為準。",
+    )
+    return MERGE_BY_MAP[label]
+
+
 def _memo_source_radio(key: str) -> str:
     """備忘錄來源選擇（回傳 shipping 的 memo_source 常數）。"""
     st.markdown("**備忘錄來源**")
@@ -113,6 +140,7 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
         label_visibility="collapsed",
     )
     memo_source = _memo_source_radio(f"{key_prefix}_memo_source")
+    merge_by = _merge_by_radio(f"{key_prefix}_merge_by")
     state_key = f"{key_prefix}_result"
 
     if uploaded is not None and st.button("🚀 開始轉換", key=f"{key_prefix}_run", type="primary"):
@@ -126,7 +154,7 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
                 else:
                     result = shipping.convert(
                         uploaded.getvalue(), uploaded.name, mode, TEMPLATE_PATH,
-                        memo_source=memo_source,
+                        memo_source=memo_source, merge_by=merge_by,
                     )
         except Exception as exc:  # noqa: BLE001 - 給使用者看得懂的訊息
             st.session_state.pop(state_key, None)
@@ -310,6 +338,7 @@ with tab_netsuite:
                 label_visibility="collapsed",
             )
             ns_memo_source = _memo_source_radio("ns_memo_source")
+            ns_merge_by = _merge_by_radio("ns_merge_by")
 
             if st.button("🚀 開始轉換", key="ns_run", type="primary"):
                 selected = edited[edited["選取"]].drop(columns=["選取"])
@@ -327,7 +356,7 @@ with tab_netsuite:
                             else:
                                 result = shipping.convert_rows(
                                     rows_for_convert, ns_mode, TEMPLATE_PATH,
-                                    memo_source=ns_memo_source,
+                                    memo_source=ns_memo_source, merge_by=ns_merge_by,
                                 )
                     except Exception as exc:
                         st.session_state.pop("ns_result", None)

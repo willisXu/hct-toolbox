@@ -12,6 +12,9 @@
   5. 備忘錄來源可選「明細行（備忘錄）」或「主要（備忘錄 (主要)）」；
      明細行備忘錄內容與該列品名相同時（2026-08 新版報表 NetSuite
      會回填品名）視為系統雜訊，不併入備註。
+  6. 合併方式可選「收件條件（原規則，第 1 點）」或「客戶採購單編號」；
+     後者採購單編號相同的訂單即合併為一張送貨單（不看訂單類型），
+     編號空白的列不合併，合併群組內收件資訊不一致時警告並以第一筆為準。
 """
 from __future__ import annotations
 
@@ -45,6 +48,10 @@ MODE_TRANSFER = "transfer"  # 調撥單未出貨明細 (162)
 # 與主要層級的「備忘錄 (主要)」時，由使用者決定要吃哪一欄。
 MEMO_SOURCE_LINE = "line"   # 明細行「備忘錄」
 MEMO_SOURCE_MAIN = "main"   # 主要「備忘錄 (主要)」
+
+# 跨單合併方式選項。
+MERGE_BY_RECIPIENT = "recipient"       # 原規則：到貨日+客戶+門市+地址，且類型>=2 含一般銷售訂單
+MERGE_BY_PURCHASE_ORDER = "po"         # 客戶採購單編號相同即合併
 
 _MEMO_ALIASES = {
     MEMO_SOURCE_LINE: ("備忘錄", "備忘錄 (主要)"),
@@ -142,18 +149,22 @@ class ConvertError(ValueError):
 def convert(
     data: bytes, filename: str, mode: str, template_path: Path,
     memo_source: str = MEMO_SOURCE_LINE,
+    merge_by: str = MERGE_BY_RECIPIENT,
 ) -> ConvertResult:
     rows = first_sheet(read_workbook(data, filename))
-    return convert_rows(rows, mode, template_path, memo_source=memo_source)
+    return convert_rows(rows, mode, template_path, memo_source=memo_source, merge_by=merge_by)
 
 
 def convert_rows(
     rows: list[list[object]], mode: str, template_path: Path,
     memo_source: str = MEMO_SOURCE_LINE,
+    merge_by: str = MERGE_BY_RECIPIENT,
 ) -> ConvertResult:
     """轉換已讀取的表格資料（header 列 + 資料列），供檔案上傳與 NetSuite 直接抓取共用。"""
     if not rows:
         raise ConvertError("來源工作表沒有可轉換的表格資料。")
+    if merge_by not in (MERGE_BY_RECIPIENT, MERGE_BY_PURCHASE_ORDER):
+        raise ConvertError(f"未知的合併方式選項：{merge_by}")
 
     headers = build_header_map(rows[0])
     alias_notes = _apply_aliases(headers, mode, memo_source)
@@ -161,7 +172,7 @@ def convert_rows(
     if missing:
         raise ConvertError("來源檔缺少必要欄位：\n" + "\n".join(f"- {h}" for h in missing))
 
-    state = _build_shipments(rows, headers, mode)
+    state = _build_shipments(rows, headers, mode, merge_by)
     state["warnings"] = alias_notes + state["warnings"]
     total_items = sum(len(s.items) for s in state["shipments"].values())
     if total_items == 0:
@@ -436,14 +447,14 @@ def _split_postal(raw_address: str) -> tuple[str, str]:
 # ------------------------------------------------------------------ 主轉換
 
 
-def _build_shipments(rows: list, headers: dict[str, int], mode: str) -> dict:
+def _build_shipments(
+    rows: list, headers: dict[str, int], mode: str,
+    merge_by: str = MERGE_BY_RECIPIENT,
+) -> dict:
     warnings: list[str] = []
     problem_rows: list[dict] = []
     input_rows = sum(1 for row in rows[1:] if not is_blank_row(row))
     skipped_rows = 0
-
-    candidate_types: dict[tuple, list[str]] = {}
-    candidate_has_general: set = set()
 
     def candidate_key_for(row: list) -> tuple:
         return (
@@ -453,29 +464,52 @@ def _build_shipments(rows: list, headers: dict[str, int], mode: str) -> dict:
             normalize_text(_cell(row, headers, "門市/倉儲地址")),
         )
 
-    for row in rows[1:]:
-        key = candidate_key_for(row)
-        if not all(key):
-            continue
-        order_type = normalize_text(_cell(row, headers, "銷售訂單類型"))
-        types = candidate_types.setdefault(key, [])
-        _add_distinct(types, order_type)
-        if order_type.casefold() == GENERAL_ORDER_TYPE.casefold():
-            candidate_has_general.add(key)
+    def document_for(row: list) -> str:
+        document = normalize_text(_cell(row, headers, "文件編號"))
+        return document or "ID-" + normalize_text(_cell(row, headers, "內部 ID"))
 
-    merged_groups = sum(
-        1
-        for key, types in candidate_types.items()
-        if len(types) >= 2 and key in candidate_has_general
-    )
+    # 合併判斷的前置掃描：
+    #   收件條件模式 → 同鍵的訂單類型集合（>=2 種且含一般銷售訂單才合併）；
+    #   採購單模式   → 同採購單編號的文件編號集合（>=2 張單才算合併群組）。
+    candidate_types: dict[tuple, list[str]] = {}
+    candidate_has_general: set = set()
+    po_documents: dict[str, set] = {}
+
+    if merge_by == MERGE_BY_PURCHASE_ORDER:
+        if "客戶採購單編號".casefold() not in headers:
+            _add_distinct(
+                warnings,
+                "來源檔沒有「客戶採購單編號」欄，無法以採購單合併，全部各自成單。",
+            )
+        for row in rows[1:]:
+            if is_blank_row(row):
+                continue
+            po = normalize_text(_cell(row, headers, "客戶採購單編號"))
+            if po:
+                po_documents.setdefault(po, set()).add(document_for(row))
+        merged_groups = sum(1 for docs in po_documents.values() if len(docs) >= 2)
+    else:
+        for row in rows[1:]:
+            key = candidate_key_for(row)
+            if not all(key):
+                continue
+            order_type = normalize_text(_cell(row, headers, "銷售訂單類型"))
+            types = candidate_types.setdefault(key, [])
+            _add_distinct(types, order_type)
+            if order_type.casefold() == GENERAL_ORDER_TYPE.casefold():
+                candidate_has_general.add(key)
+
+        merged_groups = sum(
+            1
+            for key, types in candidate_types.items()
+            if len(types) >= 2 and key in candidate_has_general
+        )
 
     shipments: dict[tuple, Shipment] = {}
 
     for row_number, row in enumerate(rows[1:], start=2):
         if is_blank_row(row):
             continue
-        key = candidate_key_for(row)
-        mergeable = all(key)
 
         document = normalize_text(_cell(row, headers, "文件編號"))
         if not document:
@@ -487,13 +521,23 @@ def _build_shipments(rows: list, headers: dict[str, int], mode: str) -> dict:
             if "銷售訂單單號".casefold() in headers:
                 _add_distinct(warnings, f"第 {row_number} 列銷售訂單單號空白，改用 {sales_order}")
 
-        is_merged = (
-            mergeable
-            and key in candidate_types
-            and len(candidate_types[key]) >= 2
-            and key in candidate_has_general
-        )
-        shipment_key = ("M", *key) if is_merged else ("S", sales_order, *key)
+        if merge_by == MERGE_BY_PURCHASE_ORDER:
+            po = normalize_text(_cell(row, headers, "客戶採購單編號"))
+            mergeable = bool(po)
+            is_merged = mergeable and len(po_documents.get(po, ())) >= 2
+            shipment_key = ("P", po) if is_merged else ("S", sales_order, po)
+            merge_blank_warning = "客戶採購單編號空白；此 SO 不跨單合併。"
+        else:
+            key = candidate_key_for(row)
+            mergeable = all(key)
+            is_merged = (
+                mergeable
+                and key in candidate_types
+                and len(candidate_types[key]) >= 2
+                and key in candidate_has_general
+            )
+            shipment_key = ("M", *key) if is_merged else ("S", sales_order, *key)
+            merge_blank_warning = "合併鍵不完整；此 SO 不跨單合併。"
 
         shipment = shipments.get(shipment_key)
         if shipment is None:
@@ -504,20 +548,44 @@ def _build_shipments(rows: list, headers: dict[str, int], mode: str) -> dict:
             shipment = Shipment(
                 merged=is_merged,
                 arrival_value=arrival_value,
-                customer=key[1],
-                location=key[2],
+                customer=normalize_text(_cell(row, headers, "出貨客戶")),
+                location=normalize_text(_cell(row, headers, "門市/倉儲")),
                 contact=normalize_text(_cell(row, headers, "門市/倉儲聯繫人")),
                 phone=_phone_to_text(_cell(row, headers, "門市/倉儲電話")),
-                address=key[3],
+                address=normalize_text(_cell(row, headers, "門市/倉儲地址")),
             )
             if arrival_warning:
                 _add_distinct(shipment.warnings, arrival_warning)
                 _add_distinct(warnings, arrival_warning)
             if mode == MODE_ORDER and not mergeable:
-                text = "合併鍵不完整；此 SO 不跨單合併。"
+                _add_distinct(shipment.warnings, merge_blank_warning)
+                _add_distinct(warnings, merge_blank_warning)
+            shipments[shipment_key] = shipment
+        elif merge_by == MERGE_BY_PURCHASE_ORDER and shipment.merged:
+            # 收件條件模式的合併鍵本身就含收件資訊，同鍵必一致；
+            # 採購單模式合併鍵只有採購單編號，收件資訊不一致要提醒（輸出以第一筆為準）。
+            mismatches = [
+                label
+                for label, first, current in (
+                    ("出貨客戶", shipment.customer, normalize_text(_cell(row, headers, "出貨客戶"))),
+                    ("門市/倉儲地址", shipment.address, normalize_text(_cell(row, headers, "門市/倉儲地址"))),
+                    (
+                        "預計到貨日期",
+                        _normalize_date_key(shipment.arrival_value),
+                        _normalize_date_key(_cell(row, headers, "DR_預計到貨日期")),
+                    ),
+                )
+                if current and current != first
+            ]
+            if mismatches:
+                # 訊息不帶列號：同一張採購單的同一種不一致只提醒一次，
+                # 避免每列各發一則把警告區塞爆。
+                text = (
+                    f"採購單 {shipment_key[1]} 合併的訂單「{'、'.join(mismatches)}」不一致，"
+                    "輸出以第一筆為準，請確認是否應該合併。"
+                )
                 _add_distinct(shipment.warnings, text)
                 _add_distinct(warnings, text)
-            shipments[shipment_key] = shipment
 
         skipped_rows += _add_row_to_shipment(
             shipment, row, row_number, headers, document, sales_order,
@@ -656,8 +724,12 @@ def _delivery_number(shipment: Shipment) -> str:
 
 def _order_number(shipment: Shipment, mode: str) -> str:
     if shipment.merged:
+        # 採購單合併的群組可能完全沒有一般銷售訂單（如全是備品出貨），
+        # 此時退回列出所有 SO，不能輸出空白訂單編號。
+        if not shipment.general_sales_orders:
+            return "、".join(shipment.sales_orders)
         if mode == MODE_ORDER:
-            return shipment.general_sales_orders[0] if shipment.general_sales_orders else ""
+            return shipment.general_sales_orders[0]
         return "、".join(shipment.general_sales_orders)
     return "、".join(shipment.sales_orders)
 
