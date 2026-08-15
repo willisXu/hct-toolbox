@@ -15,3 +15,6 @@ outputs/
 
 # Streamlit 機密設定（NetSuite API 金鑰等，勿進版控）
 .streamlit/secrets.toml
+
+# 「已轉出」紀錄（NetSuite 直接抓取分頁自動產生，屬於本機/該部署的狀態）
+data/

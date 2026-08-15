@@ -6,7 +6,7 @@
 |------|------|
 | 🛒 訂單轉換 | NetSuite 銷售訂單未出貨明細 → HCT 銷貨報表 / M00 出貨格式 |
 | 🔄 調撥單轉換 | NetSuite 調撥單未出貨明細 → HCT 銷貨報表 / M00 出貨格式 |
-| 🔗 NetSuite 直接抓取 | 免手動匯出：選 saved search → 抓資料 → 勾選要轉換的列 → 轉換 |
+| 🔗 NetSuite 直接抓取 | 免手動匯出：選 saved search → 抓資料 → 篩選 → 勾選要轉換的列 → 轉換（已轉出過的單會標記提醒） |
 | 🔍 表格核對 | 未出貨明細 × 銷貨單明細，數量與訂單編號核對 |
 | 🔁 退貨核對 | 客戶退貨授權明細（NetSuite RA）× HCT 退貨入庫格式，料號＋效期數量核對 |
 | 📊 庫存核對 | HCT × NetSuite 庫存報表核對（G00/G10/G30/G40/G80/G90 倉） |
@@ -32,6 +32,58 @@
 並列在輸出檔的「未對應組合料號」工作表與介面警告區，提醒把它補進對照表。
 298 開頭是正常組合品（ERP 有自己的品號與庫存），不拆解也不會被當成漏對照。
 
+## NetSuite 直接抓取：篩選與轉出紀錄
+
+抓回來的資料列可以先篩選再轉換：
+
+- **關鍵字**：跨所有欄位搜尋，空白分隔多個詞＝該列要同時符合（AND）。
+- **依欄位篩選**：挑要篩的欄位後出現對應篩選器 —— 一般欄位是相異值多選
+  （該欄有空白格時會多一個「（空白）」選項）、日期欄位是日期區間、
+  相異值超過 300 種的欄位改用「包含文字」。
+- **轉出紀錄**：只看未轉出過／只看已轉出過。
+
+勾選狀態記在「原始列」上，切換篩選條件不會遺失；「全選／取消全選」只作用在
+目前篩選結果。**轉換只會轉出目前表格裡（＝通過篩選）且有勾選的列**，若有已勾選
+但被篩選隱藏的列，表格下方會明白提示有幾筆不會被轉換。
+
+轉換成功後，該批資料的 **文件編號**（沒有這欄時退回內部 ID）會寫進轉出紀錄
+`data/ns_export_log.json`。下次抓到同一張單時：
+
+- 表格多一欄「⚠️ 轉出紀錄」，顯示轉出過幾次、最後一次的時間。
+- 勾選到這些列時，上方跳出提醒並列出單號、勾選明細數與轉出紀錄，避免重複出貨。
+
+紀錄最多保留 5000 張單（超過就丟最舊的）。存放位置有兩種：
+
+| 有沒有設定 Google 試算表 | 存在哪 | 能保存多久 |
+|---|---|---|
+| **有**（建議） | 你的 Google 試算表，一列一張單 | 一直都在。重新部署、休眠喚醒、換伺服器都不受影響，也能直接開試算表查或手改 |
+| 沒有 | 伺服器本機 `data/ns_export_log.json` | 本機執行是一直都在；**Streamlit Community Cloud 重新部署／休眠喚醒／重啟就會清空** |
+
+不管哪一種，「🗂️ 轉出紀錄管理」都可以下載 JSON 備份、匯入合併（同一單號次數
+相加、時間取較晚者）、清除全部紀錄。
+
+### 把轉出紀錄存到 Google 試算表
+
+1. 開一份 Google 試算表（分頁不用先建，程式第一次寫入時會自動建「轉出紀錄」分頁）。
+2. 到 [Google Cloud Console](https://console.cloud.google.com/) 建一個專案 →
+   啟用 **Google Sheets API** → 建立**服務帳戶（service account）** →
+   在該服務帳戶的「金鑰」頁建立 **JSON 金鑰**並下載。
+3. 把試算表**分享**給金鑰 JSON 裡的 `client_email`（那個
+   `xxx@xxx.iam.gserviceaccount.com`），權限選「編輯者」。
+   —— 這一步最常漏，漏了會看到 HTTP 403。
+4. 依 `.streamlit/secrets.toml.example` 的 `[gsheet_log]` 區塊，把試算表網址
+   與整份金鑰 JSON 的內容填進 `.streamlit/secrets.toml`（本機）或
+   Streamlit Cloud 的 App settings → Secrets（雲端）。
+
+設定好之後分頁下方的「轉出紀錄管理」會顯示「存放在 Google 試算表…」。
+紀錄讀取後會存在該次連線的 session 裡（避免每次重跑都連線拖慢介面），
+別人同時寫進去的紀錄要按「🔄 重新整理」才會出現；不過**寫入前一定會重讀
+試算表再合併**，所以兩個人同時轉換也不會互相蓋掉。
+
+寫入失敗（網路不通、token 過期、忘了分享試算表）時：**轉換照常完成、結果照常
+可以下載**，只會跳警告，並把這一批暫存成本機「待補紀錄」；修好之後到
+「🗂️ 轉出紀錄管理」按「📤 補寫回正本」就會補上去（不會重複計次）。
+
 ## NetSuite 直接抓取設定
 
 1. 依 `netsuite_restlet/README.md` 把 `netsuite_restlet/saved_search_restlet.js` 部署成 NetSuite RESTlet。
@@ -39,6 +91,7 @@
    Streamlit Community Cloud 的 App settings → Secrets（雲端），填入 NetSuite 帳號、
    OAuth 1.0 Token 與組好的 RESTlet 網址。**此檔含機密，不會進版控。**
 3. 需要抓別的 saved search 時，編輯 `mappings/netsuite_saved_searches.yaml` 增加項目。
+4. （選用）要讓轉出紀錄長期保存，依上一節設定 `[gsheet_log]` 存到 Google 試算表。
 
 ## 線上使用
 
@@ -66,7 +119,12 @@ core/
   bundle_split.py   # ED 訂單明細 299 組合料號拆解（split 讀檔、split_rows 共用拆解邏輯）
   xlio.py           # Excel 讀寫（NS 的 .xls 是 XML、HCT 的 .xls 是 BIFF）
   netsuite.py       # NetSuite REST OAuth 1.0 (TBA) 客戶端，呼叫 saved search RESTlet
+  table_filter.py   # 抓回來的資料列篩選（關鍵字／欄位值／包含文字／日期區間）
+  export_log.py     # 已轉出紀錄的資料結構與合併邏輯（單號 → 轉出次數/時間/格式）
+  export_store.py   # 紀錄存放後端：本機 JSON 檔 / Google 試算表
+  gsheet.py         # Google Sheets API v4（服務帳戶）讀寫
 netsuite_restlet/   # 需部署到 NetSuite 的 SuiteScript RESTlet + 部署說明
+data/               # 本機紀錄／待補紀錄 JSON（自動產生、不進版控）
 mappings/           # 輸出範本（HCT範本.xlsx、M00出貨格式.xlsx）、組合對照表、saved search 對照表
 tests/              # 回歸測試（python tests/test_core.py，免安裝 pytest）
 ```

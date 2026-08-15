@@ -19,6 +19,10 @@ sys.path.insert(0, str(BASE_DIR))
 from core import bundle_split
 from core import inventory
 from core.compare import _normalize_customer, _normalize_order_id
+from core import export_log
+from core import export_store
+from core import gsheet
+from core import table_filter
 from core.inventory import _normalize_date, _normalize_item, _normalize_location, _qty_equal
 from core.m00 import convert_rows as m00_convert_rows
 from core.return_compare import _normalize_expiry as ret_normalize_expiry, _strip_dr_prefix
@@ -606,6 +610,273 @@ def _spreadsheetml(rows: list[list[str]]) -> bytes:
         '<Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'
         f'<ss:Worksheet ss:Name="S1"><ss:Table>{cells}</ss:Table></ss:Worksheet></Workbook>'
     ).encode("utf-8")
+
+
+# ------------------------------------------------------------------ table_filter
+
+_FILTER_ROWS = [
+    ["文件編號", "出貨客戶", "DR_預計到貨日期", "出貨數量", "備忘錄"],
+    ["SO001", "屈臣氏", "2026-08-14", 12, "急件"],
+    ["SO002", "康是美", "2026-08-15", 3, ""],
+    ["SO003", "屈臣氏", "2026-08-20", 100, "補貨"],
+    ["SO004", "寶雅", "", 7, "急件"],
+]
+
+
+def test_filter_keyword_is_and_across_columns():
+    # 兩個詞要同時命中（可以分散在不同欄）
+    assert table_filter.filter_indices(_FILTER_ROWS, "屈臣氏 補貨") == [2]
+    assert table_filter.filter_indices(_FILTER_ROWS, "so00") == [0, 1, 2, 3]
+    assert table_filter.filter_indices(_FILTER_ROWS, "不存在") == []
+    # 沒給條件＝全部通過
+    assert table_filter.filter_indices(_FILTER_ROWS) == [0, 1, 2, 3]
+
+
+def test_filter_values_and_blank_option():
+    values = table_filter.distinct_values(_FILTER_ROWS, 1)
+    assert values == ["寶雅", "康是美", "屈臣氏"] or set(values) == {"寶雅", "康是美", "屈臣氏"}
+    # 到貨日那欄有空白格 → 清單開頭要有「（空白）」選項
+    dates = table_filter.distinct_values(_FILTER_ROWS, 2)
+    assert dates[0] == table_filter.BLANK_LABEL
+    assert table_filter.filter_indices(_FILTER_ROWS, value_filters={1: {"屈臣氏"}}) == [0, 2]
+    # 只選「（空白）」時，只留該欄空白的列
+    assert table_filter.filter_indices(
+        _FILTER_ROWS, value_filters={2: {table_filter.BLANK_LABEL}}
+    ) == [3]
+
+
+def test_filter_text_contains_ignores_case():
+    assert table_filter.filter_indices(_FILTER_ROWS, text_filters={0: "so00"}) == [0, 1, 2, 3]
+    assert table_filter.filter_indices(_FILTER_ROWS, text_filters={0: "SO003"}) == [2]
+
+
+def test_filter_date_range_and_column_detection():
+    from datetime import date
+
+    assert table_filter.is_date_column(_FILTER_ROWS, 2)
+    # 「出貨數量」是小整數，不能被當成 Excel 日期序號誤判成日期欄
+    assert not table_filter.is_date_column(_FILTER_ROWS, 3)
+    assert not table_filter.is_date_column(_FILTER_ROWS, 0)
+    picked = table_filter.filter_indices(
+        _FILTER_ROWS, date_ranges={2: (date(2026, 8, 15), date(2026, 8, 20))}
+    )
+    assert picked == [1, 2]
+    # 只給起日；日期解析不出來的列（空白）一律排除
+    assert table_filter.filter_indices(_FILTER_ROWS, date_ranges={2: (date(2026, 8, 20), None)}) == [2]
+
+
+def test_filter_conditions_are_combined():
+    from datetime import date
+
+    assert table_filter.filter_indices(
+        _FILTER_ROWS,
+        keyword="急件",
+        value_filters={1: {"屈臣氏"}},
+        date_ranges={2: (date(2026, 8, 1), date(2026, 8, 31))},
+    ) == [0]
+
+
+# ------------------------------------------------------------------ export_log
+
+
+def test_export_log_extract_keys_prefers_document_number():
+    rows = [
+        ["內部 ID", "文件編號", "項目"],
+        ["123", "SO001", "A"],
+        ["124", "SO002", "B"],
+    ]
+    assert export_log.extract_keys(rows) == ["SO001", "SO002"]
+    # 沒有文件編號欄時退回內部 ID
+    rows2 = [["內部 ID", "項目"], ["123", "A"]]
+    assert export_log.extract_keys(rows2) == ["123"]
+    # 兩個都沒有 → 每列空字串（不會炸掉，只是標記不了）
+    rows3 = [["項目", "數量"], ["A", 1]]
+    assert export_log.extract_keys(rows3) == [""]
+
+
+def test_export_log_mark_counts_and_dedupes():
+    from datetime import datetime as dt
+
+    log = export_log.empty_log()
+    # 同一批裡重複出現的單號只算一次（一張單有多筆明細）
+    export_log.mark(log, ["SO001", "SO001", "SO002", ""], "HCT 銷貨報表格式", dt(2026, 8, 14, 15, 3))
+    assert set(log["records"]) == {"SO001", "SO002"}
+    assert log["records"]["SO001"]["count"] == 1
+    export_log.mark(log, ["SO001"], "M00 出貨格式", dt(2026, 8, 15, 9, 0))
+    record = log["records"]["SO001"]
+    assert record["count"] == 2
+    assert record["first_at"] == "2026-08-14 15:03"
+    assert record["last_at"] == "2026-08-15 09:00"
+    assert record["formats"] == ["HCT 銷貨報表格式", "M00 出貨格式"]
+    assert "已轉出 2 次" in export_log.describe(record)
+    assert "×2" in export_log.short_label(record)
+
+
+def test_export_log_roundtrip_and_corrupt_file():
+    import tempfile
+    from datetime import datetime as dt
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "sub" / "log.json"
+        export_log.record_export(path, ["SO001"], "HCT 銷貨報表格式", dt(2026, 8, 14, 15, 3))
+        reloaded = export_log.load(path)
+        assert reloaded["records"]["SO001"]["count"] == 1
+        # 檔案壞掉不該擋住轉換，只是紀錄視為空的
+        path.write_text("{ not json", encoding="utf-8")
+        assert export_log.load(path)["records"] == {}
+        # 不存在的檔案同理
+        assert export_log.load(Path(tmp) / "nope.json")["records"] == {}
+
+
+def test_export_log_merge_backup():
+    base = export_log.empty_log()
+    export_log.mark(base, ["SO001"], "HCT 銷貨報表格式", __import__("datetime").datetime(2026, 8, 14, 10, 0))
+    other = export_log.empty_log()
+    export_log.mark(other, ["SO001", "SO009"], "M00 出貨格式", __import__("datetime").datetime(2026, 8, 16, 10, 0))
+    merged = export_log.merge(base, other)
+    assert merged["records"]["SO001"]["count"] == 2
+    assert merged["records"]["SO001"]["last_at"] == "2026-08-16 10:00"
+    assert merged["records"]["SO001"]["first_at"] == "2026-08-14 10:00"
+    assert "SO009" in merged["records"]
+
+
+def test_export_log_loads_rejects_bad_payload():
+    assert export_log.loads(b'{"version": 1, "records": {}}')["records"] == {}
+    for bad in (b"[]", b"nope", b'{"records": 5}'):
+        try:
+            export_log.loads(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"應該要拒絕：{bad!r}")
+
+
+# ------------------------------------------------------------------ export_store（Google 試算表）
+
+
+def test_sheet_rows_roundtrip():
+    from datetime import datetime as dt
+
+    log = export_log.empty_log()
+    export_log.mark(log, ["SO001"], "HCT 銷貨報表格式", dt(2026, 8, 14, 15, 3))
+    export_log.mark(log, ["SO001"], "M00 出貨格式", dt(2026, 8, 15, 9, 0))
+    export_log.mark(log, ["SO002"], "HCT 銷貨報表格式", dt(2026, 8, 16, 8, 0))
+
+    rows = export_store.log_to_rows(log)
+    assert rows[0] == export_store.SHEET_HEADER
+    # 最後轉出新的排前面
+    assert [row[0] for row in rows[1:]] == ["SO002", "SO001"]
+
+    back = export_store.rows_to_log(rows)
+    assert back["records"]["SO001"]["count"] == 2
+    assert back["records"]["SO001"]["first_at"] == "2026-08-14 15:03"
+    assert back["records"]["SO001"]["last_at"] == "2026-08-15 09:00"
+    assert back["records"]["SO001"]["formats"] == ["HCT 銷貨報表格式", "M00 出貨格式"]
+
+
+def test_sheet_rows_tolerates_manual_edits():
+    # 使用者手動調欄位順序、少幾欄、夾雜空白列，都不該讓整份紀錄壞掉
+    rows = [
+        ["最後轉出", "單號", "轉出次數"],
+        ["2026-08-14 15:03", "SO001", "3"],
+        ["", "", ""],
+        ["2026-08-15 09:00", "SO002", "x"],  # 次數壞掉 → 至少算 1 次
+    ]
+    log = export_store.rows_to_log(rows)
+    assert set(log["records"]) == {"SO001", "SO002"}
+    assert log["records"]["SO001"]["count"] == 3
+    assert log["records"]["SO002"]["count"] == 1
+    # 空試算表
+    assert export_store.rows_to_log([])["records"] == {}
+
+
+def test_local_store_record_and_clear():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = export_store.LocalStore(Path(tmp) / "log.json")
+        assert store.is_empty()
+        store.record(["SO001", "SO001"], "HCT 銷貨報表格式")
+        assert list(store.load()["records"]) == ["SO001"]
+        store.clear()
+        assert store.is_empty()
+
+
+def test_sheet_store_record_merges_into_sheet_content():
+    """SheetStore.record 要先重讀試算表再合併，不能把別人剛寫的蓋掉。"""
+
+    class FakeClient:
+        spreadsheet_id = "fake"
+
+        def __init__(self):
+            self.pages = {}
+
+        def read(self, worksheet, a1="A:Z"):
+            return self.pages.get(worksheet, [])
+
+        def write(self, worksheet, values, a1="A:Z"):
+            self.pages[worksheet] = values
+
+    client = FakeClient()
+    store = export_store.SheetStore(client, "轉出紀錄")
+    store.record(["SO001"], "HCT 銷貨報表格式")
+    # 模擬別人在這期間寫進去的另一張單
+    other = export_store.rows_to_log(client.read("轉出紀錄"))
+    export_log.mark(other, ["SO999"], "M00 出貨格式")
+    client.write("轉出紀錄", export_store.log_to_rows(other))
+
+    store.record(["SO001"], "M00 出貨格式")
+    final = store.load()["records"]
+    assert set(final) == {"SO001", "SO999"}
+    assert final["SO001"]["count"] == 2
+
+
+def test_build_sheet_store_validates_config():
+    # 有些貼上方式會讓 private_key 變成「字面上的 \n」而不是真的換行
+    literal_nl = chr(92) + "n"
+    good = {
+        "spreadsheet_id": "https://docs.google.com/spreadsheets/d/ABC123/edit#gid=0",
+        "service_account": {
+            "client_email": "a@b.iam.gserviceaccount.com",
+            "private_key": (
+                "-----BEGIN PRIVATE KEY-----" + literal_nl + "x" + literal_nl + "-----END PRIVATE KEY-----"
+            ),
+            "token_uri": "https://oauth2.googleapis.com/token",
+        },
+    }
+    store = export_store.build_sheet_store(good)
+    assert store.client.spreadsheet_id == "ABC123"
+    assert store.worksheet == export_store.DEFAULT_WORKSHEET
+    # 字面上的 \n 要被救回成真正的換行，不然 google-auth 解不出金鑰
+    assert chr(10) in store.client.info["private_key"]
+    assert literal_nl not in store.client.info["private_key"]
+
+    bad_configs = (
+        {},
+        {"spreadsheet_id": "x"},
+        {"spreadsheet_id": "x", "service_account": {"client_email": "a"}},
+    )
+    for bad in bad_configs:
+        try:
+            export_store.build_sheet_store(bad)
+        except gsheet.SheetError:
+            pass
+        else:
+            raise AssertionError(f"應該要拒絕：{bad}")
+
+
+def test_extract_spreadsheet_id():
+    assert gsheet.extract_spreadsheet_id("ABC123") == "ABC123"
+    assert gsheet.extract_spreadsheet_id(
+        "https://docs.google.com/spreadsheets/d/1a-B_c/edit?gid=0#gid=0"
+    ) == "1a-B_c"
+    for bad in ("", "   ", "https://example.com/nope"):
+        try:
+            gsheet.extract_spreadsheet_id(bad)
+        except gsheet.SheetError:
+            pass
+        else:
+            raise AssertionError(f"應該要拒絕：{bad!r}")
 
 
 # ------------------------------------------------------------------ 執行器

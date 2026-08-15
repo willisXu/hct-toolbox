@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -25,11 +26,14 @@ import yaml
 
 from core import bundle_split as bundle_split_mod
 from core import compare as compare_mod
+from core import export_log as export_log_mod
+from core import export_store as export_store_mod
 from core import inventory as inventory_mod
 from core import m00 as m00_mod
 from core import netsuite as netsuite_mod
 from core import return_compare as return_compare_mod
 from core import shipping
+from core import table_filter
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "mappings" / "HCT範本.xlsx"
@@ -218,6 +222,17 @@ with tab_transfer:
 
 # ------------------------------------------------------------ NetSuite 直接抓取
 
+# 「已轉出」紀錄：轉換成功的單號記下來，下次抓到同一張單會標記＋提醒。
+# 正本優先存 Google 試算表（secrets 有設 [gsheet_log] 時），雲端部署重啟也不會掉；
+# 沒設定就退回本機 JSON 檔（雲端的檔案系統是暫時的，重啟會清空）。
+NS_EXPORT_LOG_PATH = BASE_DIR / "data" / "ns_export_log.json"
+# 寫進 Google 試算表失敗時，先把這一批記在這裡，等連線恢復再補寫回去。
+NS_PENDING_LOG_PATH = BASE_DIR / "data" / "ns_export_pending.json"
+
+EXPORT_FILTER_ALL = "全部"
+EXPORT_FILTER_NEW = "只看未轉出過"
+EXPORT_FILTER_DONE = "只看已轉出過"
+
 
 def _load_saved_searches() -> list[dict]:
     path = BASE_DIR / "mappings" / "netsuite_saved_searches.yaml"
@@ -243,13 +258,208 @@ def _netsuite_client() -> tuple[netsuite_mod.NetSuiteClient, str]:
     return netsuite_mod.NetSuiteClient(cfg), cfg["restlet_url"]
 
 
+@st.cache_resource(show_spinner=False)
+def _sheet_store(fingerprint: str):
+    """Google 試算表 store。憑證與連線重用，不然每次重跑都要重新取 token。"""
+    del fingerprint  # 只用來讓設定變更時換一個 cache 項目
+    return export_store_mod.build_sheet_store(st.secrets["gsheet_log"])
+
+
+def _export_store() -> tuple[object, str | None]:
+    """回傳（紀錄存放後端, 設定錯誤訊息）。沒設定 Google 試算表就用本機檔案。"""
+    try:
+        cfg = st.secrets["gsheet_log"]
+    except Exception:
+        return export_store_mod.LocalStore(NS_EXPORT_LOG_PATH), None
+    try:
+        fingerprint = f"{cfg.get('spreadsheet_id') or cfg.get('spreadsheet_url')}|{cfg.get('worksheet')}"
+        return _sheet_store(fingerprint), None
+    except Exception as exc:  # noqa: BLE001 - 設定錯不該讓整個分頁掛掉
+        return export_store_mod.LocalStore(NS_EXPORT_LOG_PATH), str(exc)
+
+
+def _export_state(store, refresh: bool = False) -> dict:
+    """讀一次紀錄後存在 session：Google 試算表每次重跑都連線會讓介面很鈍。
+
+    寫入（轉換、匯入、清除）之後會帶 refresh=True 重讀，所以自己操作的
+    結果一定看得到；別人同時寫進試算表的，要按「🔄 重新整理」才會出現。
+    """
+    cache = st.session_state.get("ns_log_cache")
+    if refresh or not cache or cache.get("name") != store.name:
+        try:
+            log = store.load()
+            error = None
+        except Exception as exc:  # noqa: BLE001 - 讀不到紀錄不該擋住轉換
+            log = export_log_mod.empty_log()
+            error = str(exc)
+        cache = {
+            "name": store.name,
+            "log": log,
+            "error": error,
+            "at": datetime.now().strftime("%H:%M:%S"),
+        }
+        st.session_state["ns_log_cache"] = cache
+    return cache
+
+
+def _unique_columns(header_row: list) -> list[str]:
+    """欄名去重＋補空欄名（saved search 可能有同名欄，DataFrame 不允許重複欄名）。"""
+    used: dict[str, int] = {}
+    result: list[str] = []
+    for index, value in enumerate(header_row):
+        name = str(value).strip() if value is not None else ""
+        if not name:
+            name = f"欄{index + 1}"
+        if name in used:
+            used[name] += 1
+            name = f"{name} ({used[name]})"
+        else:
+            used[name] = 1
+        result.append(name)
+    return result
+
+
+def _date_range(picked) -> tuple[object, object]:
+    """st.date_input 的區間選擇：使用者只點了起日時回 (起, None)，沒選回 (None, None)。"""
+    if isinstance(picked, (list, tuple)):
+        if len(picked) >= 2:
+            return picked[0], picked[1]
+        if len(picked) == 1:
+            return picked[0], None
+        return None, None
+    return (picked, picked) if picked else (None, None)
+
+
+def _ns_filter_panel(
+    ns_rows: list[list[object]], columns: list[str], fetch_seq: int, exported_flags: list[bool]
+) -> tuple[list[int], str]:
+    """篩選面板。回傳（通過篩選的資料列索引, 篩選條件簽章）。
+
+    簽章併進 data_editor 的 key：篩選條件一變就換一個 widget，避免
+    Streamlit 把上一組篩選結果的勾選差異（依列位置記錄）套到不同的列上。
+    """
+    prefix = f"ns_filter_{fetch_seq}"
+    total = len(ns_rows) - 1
+    with st.expander("🔎 篩選條件（先篩出要的資料，再勾選轉換）", expanded=True):
+        keyword = st.text_input(
+            "關鍵字",
+            key=f"{prefix}_keyword",
+            placeholder="跨所有欄位搜尋，空白分隔多個詞＝要同時符合",
+            help="例如輸入「SO12345 台北」＝該列同時出現這兩個詞才留下。",
+        )
+        chosen = st.multiselect(
+            "依欄位篩選（可複選欄位）",
+            columns,
+            key=f"{prefix}_columns",
+            help="選了哪些欄位，下面就出現對應的篩選器：一般欄位是值多選，日期欄位是日期區間，相異值太多的欄位改用「包含文字」。",
+        )
+        value_filters: dict[int, set[str]] = {}
+        text_filters: dict[int, str] = {}
+        date_ranges: dict[int, tuple[object, object]] = {}
+        if chosen:
+            grid = st.columns(min(len(chosen), 3))
+            for position, name in enumerate(chosen):
+                col_index = columns.index(name)
+                with grid[position % len(grid)]:
+                    if table_filter.is_date_column(ns_rows, col_index):
+                        picked = st.date_input(
+                            f"{name}（日期區間）",
+                            value=(),
+                            key=f"{prefix}_date_{col_index}",
+                            format="YYYY-MM-DD",
+                        )
+                        start, end = _date_range(picked)
+                        if start or end:
+                            date_ranges[col_index] = (start, end)
+                    else:
+                        values = table_filter.distinct_values(
+                            ns_rows, col_index, limit=table_filter.MAX_CHOICES
+                        )
+                        if len(values) <= table_filter.MAX_CHOICES:
+                            picked_values = st.multiselect(
+                                name, values, key=f"{prefix}_value_{col_index}"
+                            )
+                            if picked_values:
+                                value_filters[col_index] = set(picked_values)
+                        else:
+                            typed = st.text_input(
+                                f"{name}（包含文字）",
+                                key=f"{prefix}_text_{col_index}",
+                                help=f"這一欄相異值超過 {table_filter.MAX_CHOICES} 種，改用包含文字比對。",
+                            )
+                            if typed.strip():
+                                text_filters[col_index] = typed.strip()
+
+        export_filter = st.radio(
+            "轉出紀錄",
+            [EXPORT_FILTER_ALL, EXPORT_FILTER_NEW, EXPORT_FILTER_DONE],
+            key=f"{prefix}_export",
+            horizontal=True,
+            help="依「這張單先前有沒有轉出過出貨格式表格」篩選。",
+        )
+
+        visible = table_filter.filter_indices(
+            ns_rows, keyword, value_filters, text_filters, date_ranges
+        )
+        if export_filter == EXPORT_FILTER_NEW:
+            visible = [i for i in visible if not exported_flags[i]]
+        elif export_filter == EXPORT_FILTER_DONE:
+            visible = [i for i in visible if exported_flags[i]]
+
+        reset_col, info_col = st.columns([1, 4])
+        with reset_col:
+            if st.button("🧹 清除篩選", key=f"{prefix}_reset", use_container_width=True):
+                for state_key in [k for k in st.session_state if k.startswith(prefix)]:
+                    del st.session_state[state_key]
+                st.rerun()
+        with info_col:
+            st.caption(f"篩選後 **{len(visible)}** / 共 **{total}** 筆")
+
+    signature_source = (
+        keyword,
+        sorted((index, sorted(values)) for index, values in value_filters.items()),
+        sorted(text_filters.items()),
+        sorted((index, str(start), str(end)) for index, (start, end) in date_ranges.items()),
+        export_filter,
+    )
+    signature = hashlib.md5(repr(signature_source).encode("utf-8")).hexdigest()[:8]
+    return visible, signature
+
+
 with tab_netsuite:
     st.subheader("Saved Search → 直接抓取轉換")
     st.markdown(
         "1. 選擇要抓取的 saved search，按「抓取資料」\n"
-        "2. 抓回後可在表格勾選要轉換的列（預設全選；也可用「全選」「取消全選」批量調整）\n"
-        "3. 選擇輸出格式與備忘錄來源，按「開始轉換」，完成後點「下載結果」"
+        "2. 用「篩選條件」篩出要的資料（關鍵字／欄位值／日期區間／有沒有轉出過）\n"
+        "3. 在表格勾選要轉換的列（預設全選；「全選／取消全選」只作用在目前篩選結果）\n"
+        "4. 選擇輸出格式與備忘錄來源，按「開始轉換」，完成後點「下載結果」\n\n"
+        "轉換成功的單號會記進「轉出紀錄」，下次抓到同一張單會在表格標記 ⚠️，"
+        "勾選時另外跳出提醒，避免重複轉出。"
     )
+
+    ns_store, ns_store_config_error = _export_store()
+    if ns_store_config_error:
+        st.error(
+            "Google 試算表設定有問題，這次改用本機檔案暫存轉出紀錄"
+            f"（伺服器重啟後會消失）：{ns_store_config_error}"
+        )
+    ns_log_state = _export_state(ns_store)
+    export_records = ns_log_state["log"].get("records", {})
+    if ns_log_state["error"]:
+        st.error(
+            f"讀取轉出紀錄失敗：{ns_log_state['error']}\n\n"
+            "這次不會顯示「已轉出」標記與提醒，請確認後按「🗂️ 轉出紀錄管理 → 🔄 重新整理」。"
+        )
+    ns_pending_store = export_store_mod.LocalStore(NS_PENDING_LOG_PATH)
+    ns_pending_records = ns_pending_store.load().get("records", {})
+    if ns_pending_records:
+        st.warning(
+            f"有 **{len(ns_pending_records)}** 張單的轉出紀錄還沒寫進 {ns_store.label}"
+            "（先前寫入失敗，先暫存在伺服器本機）。"
+            "請到下方「🗂️ 轉出紀錄管理」按「📤 補寫回正本」，"
+            "否則伺服器重啟後這幾筆紀錄就沒了。"
+        )
+
     searches = _load_saved_searches()
     if not searches:
         st.info("尚未設定 saved search，請編輯 mappings/netsuite_saved_searches.yaml 填入 search_id。")
@@ -284,85 +494,182 @@ with tab_netsuite:
         fetched = st.session_state.get("ns_rows")
         if fetched:
             ns_rows, ns_mode, ns_label = fetched
-            st.success(f"已抓取「{ns_label}」共 {len(ns_rows) - 1} 筆資料列。")
-
-            # nonce 隨資料集（saved search + 筆數）變化，「全選/取消全選」
-            # 每次按下都會讓 nonce +1、換一組新的 data_editor key，強制
-            # Streamlit 重建 widget、整批套用新的勾選狀態（即使兩次都按
-            # 同一個按鈕，也要蓋掉使用者中途手動勾/取消的個別列）。
             fetch_seq = st.session_state.get("ns_fetch_seq", 0)
-            default_key = f"ns_select_default_{ns_label}_{fetch_seq}_{len(ns_rows)}"
-            nonce_key = f"ns_select_nonce_{ns_label}_{fetch_seq}_{len(ns_rows)}"
-            if default_key not in st.session_state:
-                st.session_state[default_key] = True
+            total_rows = len(ns_rows) - 1
+            st.success(f"已抓取「{ns_label}」共 {total_rows} 筆資料列。")
+
+            # 表格與單號只在「新抓一批」時重算，篩選/勾選重跑不必重建。
+            ns_columns = _unique_columns(ns_rows[0])
+            cache = st.session_state.get("ns_cache")
+            if not cache or cache.get("seq") != fetch_seq:
+                cache = {
+                    "seq": fetch_seq,
+                    "df": pd.DataFrame(ns_rows[1:], columns=ns_columns),
+                    "keys": export_log_mod.extract_keys(ns_rows),
+                }
+                st.session_state["ns_cache"] = cache
+            base_df = cache["df"]
+            row_keys = cache["keys"]
+
+            exported_flags = [bool(key) and key in export_records for key in row_keys]
+            if any(exported_flags):
+                st.info(
+                    f"這批資料裡有 **{sum(exported_flags)}** 筆明細所屬的單號先前已經轉出過"
+                    "（表格「轉出紀錄」欄標記 ⚠️）；只想看沒轉過的，可在篩選條件選「只看未轉出過」。"
+                )
+
+            visible_idx, filter_sig = _ns_filter_panel(
+                ns_rows, ns_columns, fetch_seq, exported_flags
+            )
+
+            # 勾選狀態存原始列索引，不隨篩選改變而遺失（切換篩選再切回來還在）。
+            select_key = f"ns_selected_{fetch_seq}"
+            if select_key not in st.session_state:
+                st.session_state[select_key] = set(range(total_rows))
+            selected: set[int] = st.session_state[select_key]
+
+            # nonce：按下「全選/取消全選」時 +1，換一組新的 data_editor key，
+            # 強制 Streamlit 重建 widget、整批套用新的勾選狀態（否則殘留的
+            # 個別勾選差異會蓋掉程式剛設好的值）。
+            nonce_key = f"ns_select_nonce_{fetch_seq}"
+            if nonce_key not in st.session_state:
                 st.session_state[nonce_key] = 0
 
             btn_col1, btn_col2, _btn_col3 = st.columns([1, 1, 5])
             with btn_col1:
-                if st.button("☑️ 全選", key="ns_select_all", use_container_width=True):
-                    st.session_state[default_key] = True
+                if st.button("☑️ 全選（篩選結果）", key="ns_select_all", use_container_width=True):
+                    selected.update(visible_idx)
                     st.session_state[nonce_key] += 1
             with btn_col2:
-                if st.button("⬜ 取消全選", key="ns_deselect_all", use_container_width=True):
-                    st.session_state[default_key] = False
+                if st.button("⬜ 取消全選（篩選結果）", key="ns_deselect_all", use_container_width=True):
+                    selected.difference_update(visible_idx)
                     st.session_state[nonce_key] += 1
 
-            preview = pd.DataFrame(ns_rows[1:], columns=[str(c) for c in ns_rows[0]])
-            preview.insert(0, "選取", st.session_state[default_key])
-            editor_key = f"ns_editor_{ns_label}_{fetch_seq}_{len(ns_rows)}_{st.session_state[nonce_key]}"
-            edited = st.data_editor(
-                preview,
-                # key 隨資料集、以及「全選/取消全選」的 nonce 變化，兩者任一
-                # 改變都強制 Streamlit 重建 widget，避免殘留前一批資料或
-                # 前一次個別勾選狀態，悄悄漏掉使用者以為有勾選的列。
-                key=editor_key,
-                use_container_width=True,
-                hide_index=True,
-                height=420,
-                disabled=[c for c in preview.columns if c != "選取"],
-                column_config={
-                    "選取": st.column_config.CheckboxColumn(
-                        "✅ 選取", default=True, width="small", help="勾選要轉換的資料列"
-                    ),
-                },
-            )
-            selected_count = int(edited["選取"].sum())
-            st.caption(f"已勾選 **{selected_count}** / 共 **{len(edited)}** 筆")
-
-            st.markdown("**輸出格式**")
-            ns_format = st.radio(
-                "輸出格式",
-                [FORMAT_HCT, FORMAT_M00],
-                key="ns_format",
-                horizontal=True,
-                label_visibility="collapsed",
-            )
-            ns_memo_source = _memo_source_radio("ns_memo_source")
-            ns_merge_by = _merge_by_radio("ns_merge_by")
-
-            if st.button("🚀 開始轉換", key="ns_run", type="primary"):
-                selected = edited[edited["選取"]].drop(columns=["選取"])
-                if selected.empty:
-                    st.warning("沒有勾選任何資料列。")
-                else:
-                    rows_for_convert = [list(ns_rows[0])] + selected.values.tolist()
-                    try:
-                        with st.spinner("轉換中..."):
-                            if ns_format == FORMAT_M00:
-                                result = m00_mod.convert_rows(
-                                    rows_for_convert, ns_mode, M00_TEMPLATE_PATH,
-                                    memo_source=ns_memo_source,
-                                )
-                            else:
-                                result = shipping.convert_rows(
-                                    rows_for_convert, ns_mode, TEMPLATE_PATH,
-                                    memo_source=ns_memo_source, merge_by=ns_merge_by,
-                                )
-                    except Exception as exc:
-                        st.session_state.pop("ns_result", None)
-                        _show_error(exc)
+            if not visible_idx:
+                st.info("目前的篩選條件沒有任何符合的資料列，請調整條件或按「清除篩選」。")
+            else:
+                view = base_df.loc[visible_idx].copy()
+                view.insert(0, "選取", [index in selected for index in visible_idx])
+                if any(exported_flags):
+                    view.insert(1, "轉出紀錄", [
+                        export_log_mod.short_label(export_records[row_keys[index]])
+                        if exported_flags[index] else ""
+                        for index in visible_idx
+                    ])
+                editor_key = f"ns_editor_{fetch_seq}_{filter_sig}_{st.session_state[nonce_key]}"
+                edited = st.data_editor(
+                    view,
+                    key=editor_key,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=420,
+                    disabled=[c for c in view.columns if c != "選取"],
+                    column_config={
+                        "選取": st.column_config.CheckboxColumn(
+                            "✅ 選取", default=True, width="small", help="勾選要轉換的資料列"
+                        ),
+                        "轉出紀錄": st.column_config.TextColumn(
+                            "⚠️ 轉出紀錄", width="medium", help="這張單先前已經轉出過出貨格式表格的次數與時間"
+                        ),
+                    },
+                )
+                # 把這次的勾選寫回原始列索引（data_editor 回傳的列序與傳入相同）。
+                edited_flags = list(edited["選取"])
+                for position, row_index in enumerate(visible_idx):
+                    if position >= len(edited_flags):
+                        break
+                    if bool(edited_flags[position]):
+                        selected.add(row_index)
                     else:
-                        st.session_state["ns_result"] = (result, ns_label)
+                        selected.discard(row_index)
+
+                visible_selected = [index for index in visible_idx if index in selected]
+                hidden_selected = len(selected) - len(visible_selected)
+                st.caption(
+                    f"已勾選 **{len(visible_selected)}** / 篩選後 **{len(visible_idx)}** 筆"
+                    f"（這批資料共 {total_rows} 筆）"
+                )
+                if hidden_selected:
+                    st.caption(
+                        f"ℹ️ 另有 **{hidden_selected}** 筆已勾選、但被目前篩選條件隱藏，"
+                        "**不會**被轉換（只轉換上面表格裡勾選的列）。"
+                    )
+
+                # 已轉出提醒：勾到先前轉過的單就明白列出來，讓人再確認一次。
+                repeat: dict[str, int] = {}
+                for index in visible_selected:
+                    if exported_flags[index]:
+                        key = row_keys[index]
+                        repeat[key] = repeat.get(key, 0) + 1
+                if repeat:
+                    st.warning(
+                        f"⚠️ 已勾選的資料裡有 **{len(repeat)}** 張單（共 {sum(repeat.values())} 筆明細）"
+                        "先前已經轉出過出貨格式表格，請確認是不是真的要再轉一次。"
+                    )
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "單號": key,
+                                "本次勾選明細": count,
+                                "轉出紀錄": export_log_mod.describe(export_records[key]),
+                            }
+                            for key, count in repeat.items()
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                st.markdown("**輸出格式**")
+                ns_format = st.radio(
+                    "輸出格式",
+                    [FORMAT_HCT, FORMAT_M00],
+                    key="ns_format",
+                    horizontal=True,
+                    label_visibility="collapsed",
+                )
+                ns_memo_source = _memo_source_radio("ns_memo_source")
+                ns_merge_by = _merge_by_radio("ns_merge_by")
+
+                if st.button("🚀 開始轉換", key="ns_run", type="primary"):
+                    if not visible_selected:
+                        st.warning("目前篩選結果裡沒有勾選任何資料列。")
+                    else:
+                        # 直接取原始列（不經過 DataFrame），避免型別被 pandas 動到。
+                        rows_for_convert = [list(ns_rows[0])] + [
+                            list(ns_rows[index + 1]) for index in visible_selected
+                        ]
+                        try:
+                            with st.spinner("轉換中..."):
+                                if ns_format == FORMAT_M00:
+                                    result = m00_mod.convert_rows(
+                                        rows_for_convert, ns_mode, M00_TEMPLATE_PATH,
+                                        memo_source=ns_memo_source,
+                                    )
+                                else:
+                                    result = shipping.convert_rows(
+                                        rows_for_convert, ns_mode, TEMPLATE_PATH,
+                                        memo_source=ns_memo_source, merge_by=ns_merge_by,
+                                    )
+                        except Exception as exc:
+                            st.session_state.pop("ns_result", None)
+                            _show_error(exc)
+                        else:
+                            st.session_state["ns_result"] = (result, ns_label)
+                            # 轉換成功才記錄。寫紀錄失敗不影響已經產好的結果，
+                            # 只警告並把這一批存進待補紀錄，之後可以補寫回正本。
+                            converted_keys = [row_keys[index] for index in visible_selected]
+                            try:
+                                ns_store.record(converted_keys, ns_format)
+                            except Exception as exc:  # noqa: BLE001
+                                st.session_state["ns_log_error"] = str(exc)
+                                try:
+                                    ns_pending_store.record(converted_keys, ns_format)
+                                except OSError:
+                                    pass  # 連本機都寫不了，警告訊息已經夠了
+                            else:
+                                st.session_state.pop("ns_log_error", None)
+                            _export_state(ns_store, refresh=True)
+                            st.rerun()
 
         stored = st.session_state.get("ns_result")
         if stored:
@@ -375,6 +682,12 @@ with tab_netsuite:
                 f"輸出品項 **{result.output_items}**、"
                 f"無法轉換明細 **{result.problem_count}**、警告 **{len(result.warnings)}**"
             )
+            log_error = st.session_state.get("ns_log_error")
+            if log_error:
+                st.warning(
+                    f"⚠️ 轉出紀錄寫入失敗（**不影響這次的轉換結果**）：{log_error}\n\n"
+                    "這一批已暫存成「待補紀錄」，請到下方「🗂️ 轉出紀錄管理」補寫回正本。"
+                )
             st.download_button(
                 f"⬇️ 下載結果（{result.output_name}）",
                 data=result.output_bytes,
@@ -390,6 +703,118 @@ with tab_netsuite:
                 with st.expander(f"⚠️ 警告訊息（{len(result.warnings)} 則）"):
                     for warning in result.warnings:
                         st.text(f"• {warning}")
+
+    # ---------------------------------------------------------- 轉出紀錄管理
+    with st.expander("🗂️ 轉出紀錄管理", expanded=bool(ns_pending_records)):
+        current_log = ns_log_state["log"]
+        current_records = current_log.get("records", {})
+        info_col, refresh_col = st.columns([4, 1])
+        with info_col:
+            st.caption(
+                f"目前記錄 **{len(current_records)}** 張單，存放在 {ns_store.label}"
+                f"（讀取於 {ns_log_state['at']}）。"
+            )
+            if ns_store.kind == "sheet":
+                st.caption(
+                    "紀錄存在 Google 試算表，伺服器重啟／重新部署都不會消失，"
+                    "也可以直接開試算表查或手動修改（改完按 🔄 重新整理）。"
+                )
+            else:
+                st.caption(
+                    "尚未設定 Google 試算表，紀錄存在伺服器本機檔案 —— "
+                    "**雲端部署重啟後會清空**，請定期下載備份，或依 README 設定 Google 試算表。"
+                )
+        with refresh_col:
+            if st.button("🔄 重新整理", key="ns_log_refresh", use_container_width=True):
+                _export_state(ns_store, refresh=True)
+                st.rerun()
+
+        if ns_pending_records:
+            st.warning(
+                f"待補紀錄：**{len(ns_pending_records)}** 張單還沒寫進正本。"
+            )
+            if st.button("📤 補寫回正本", key="ns_log_sync", type="primary"):
+                try:
+                    merged = export_log_mod.merge(ns_store.load(), ns_pending_store.load())
+                    ns_store.save(merged)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"補寫失敗：{exc}")
+                else:
+                    ns_pending_store.clear()
+                    _export_state(ns_store, refresh=True)
+                    st.rerun()
+
+        if current_records:
+            recent = sorted(
+                current_records.items(),
+                key=lambda kv: str(kv[1].get("last_at") or ""),
+                reverse=True,
+            )[:200]
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "單號": key,
+                        "轉出次數": record.get("count"),
+                        "最後轉出": record.get("last_at"),
+                        "最後格式": record.get("last_format"),
+                        "首次轉出": record.get("first_at"),
+                    }
+                    for key, record in recent
+                ]),
+                use_container_width=True,
+                hide_index=True,
+                height=240,
+            )
+            if len(current_records) > len(recent):
+                st.caption(f"（只顯示最近 {len(recent)} 張，完整內容請下載備份或直接看試算表）")
+        else:
+            st.caption("目前還沒有任何轉出紀錄。")
+
+        log_col1, log_col2 = st.columns(2)
+        with log_col1:
+            st.download_button(
+                "⬇️ 下載紀錄備份（JSON）",
+                data=export_log_mod.dumps(current_log),
+                file_name=NS_EXPORT_LOG_PATH.name,
+                mime="application/json",
+                key="ns_log_download",
+                use_container_width=True,
+            )
+        with log_col2:
+            confirm_clear = st.checkbox("我確定要清除全部轉出紀錄", key="ns_log_clear_confirm")
+            if st.button(
+                "🗑️ 清除全部紀錄",
+                key="ns_log_clear",
+                disabled=not confirm_clear,
+                use_container_width=True,
+            ):
+                try:
+                    ns_store.clear()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"清除失敗：{exc}")
+                else:
+                    st.session_state["ns_log_clear_confirm"] = False
+                    _export_state(ns_store, refresh=True)
+                    st.rerun()
+
+        uploaded_log = st.file_uploader(
+            "匯入紀錄備份（與現有紀錄合併，次數相加、時間取較晚者）",
+            type=["json"],
+            key="ns_log_upload",
+        )
+        if uploaded_log is not None and st.button("📤 合併匯入", key="ns_log_import"):
+            try:
+                incoming = export_log_mod.loads(uploaded_log.getvalue())
+                merged = export_log_mod.merge(ns_store.load(), incoming)
+                ns_store.save(merged)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"匯入失敗：{exc}")
+            else:
+                _export_state(ns_store, refresh=True)
+                st.success(
+                    f"已匯入 {len(incoming.get('records', {}))} 張單的紀錄，"
+                    f"合併後共 {len(merged.get('records', {}))} 張。"
+                )
 
 # ------------------------------------------------------------ 表格核對
 
