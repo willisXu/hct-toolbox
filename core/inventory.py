@@ -9,10 +9,12 @@
     欄位 SKU、商品名稱、有效日期、數量、組合保留、批號；報表沒有倉別欄，
     一律視為 M00 倉，庫存量＝數量＋組合保留(單品數量庫存，已用
     「庫存總表-單品」的庫存總數驗證)，同時當作可用量與總庫存量。
-  - HCT 對帳只核對 G00/G10/G30/G40/G80/G90 倉；代工廠對帳只核對 D 開頭
-    代工廠倉(D01 凱芬妮、D03 詠麗…)，「合計／總計」小計列列入排除數；
-    M00 對帳只核對 M00 開頭倉別(各 M00 開頭代碼收斂成 M00 核對鍵)。
-    非核對範圍的倉別一律列入排除數。
+  - HCT 與代工廠對帳不限定倉別：來源報表有什麼倉別就核對什麼，新倉別
+    (如 G15 新竹低效良品倉)不必改程式就會納入。代工廠報表的「合計／總計」
+    小計列仍列入排除數。
+  - M00 對帳例外，仍只核對 M00 開頭倉別並把各 M00 開頭代碼收斂成 M00
+    核對鍵：M00 報表沒有倉別欄，整份強制視為 M00 倉，NetSuite 側若不限定
+    範圍，每一筆非 M00 倉都會變成假的「僅 NetSuite 存在」。
   - 代工廠報表只有一個「庫存數量」欄，同時當作可用量與總庫存量(同 293 格式)。
   - 以「倉別+料號+到期日」做日期明細核對，另以「倉別+料號」做料號彙總核對。
   - 差異基準：HCT／代工廠／M00－NetSuite。
@@ -29,9 +31,10 @@ SYSTEM_HCT = "HCT"
 SYSTEM_CONTRACT = "代工廠"
 SYSTEM_M00 = "M00"
 SYSTEM_NETSUITE = "NetSuite"
-APPROVED_LOCATIONS = {"G00", "G10", "G30", "G40", "G80", "G90"}
-CONTRACT_LOCATION_PREFIX = "D"
+# 只剩 M00 需要倉別範圍(理由見模組 docstring)；HCT／代工廠不再限定倉別，
+# 以免新增倉別被默默排除——G15 新竹低效良品倉就是這樣整批不見的。
 M00_LOCATION_PREFIX = "M00"
+ALL_LOCATIONS_TEXT = "全部倉別（不限定）"
 
 STATUS_MATCH = "完全一致"
 STATUS_AVAILABLE_DIFF = "僅可用量差異"
@@ -496,19 +499,19 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
         excluded_label = "排除非 M00 倉筆數"
         output_prefix = "M00庫存核對結果"
     elif ext_system == SYSTEM_CONTRACT:
-        # 代工廠對帳只看 D 開頭代工廠倉(兩邊都套同一條規則)。
-        def location_ok(location: str) -> bool:
-            return location.startswith(CONTRACT_LOCATION_PREFIX)
+        # 不限定倉別；「合計／總計」小計列仍由上游的空倉別判斷排除。
+        def location_ok(_location: str) -> bool:
+            return True
         ext_label = SYSTEM_CONTRACT
-        scope_text = f"{CONTRACT_LOCATION_PREFIX} 開頭代工廠倉"
-        excluded_label = "排除非 D 倉／合計列筆數"
+        scope_text = ALL_LOCATIONS_TEXT
+        excluded_label = "排除合計／總計列筆數"
         output_prefix = "代工廠庫存核對結果"
     else:
-        def location_ok(location: str) -> bool:
-            return location in APPROVED_LOCATIONS
+        def location_ok(_location: str) -> bool:
+            return True
         ext_label = SYSTEM_HCT
-        scope_text = "、".join(sorted(APPROVED_LOCATIONS))
-        excluded_label = "排除非 G 倉筆數"
+        scope_text = ALL_LOCATIONS_TEXT
+        excluded_label = "排除筆數"
         output_prefix = "庫存核對結果"
 
     hct_detail: dict = {}
@@ -588,7 +591,7 @@ def _status_fill(ext_label: str) -> dict:
 
 
 def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats,
-                  ext_label=SYSTEM_HCT, scope_text="", excluded_label="排除非 G 倉筆數") -> bytes:
+                  ext_label=SYSTEM_HCT, scope_text="", excluded_label="排除筆數") -> bytes:
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -621,7 +624,7 @@ def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats,
     summary["C10"] = len(item_rows)
 
     summary["A12"] = "核對範圍倉別"
-    summary["B12"] = scope_text or "、".join(sorted(APPROVED_LOCATIONS))
+    summary["B12"] = scope_text or ALL_LOCATIONS_TEXT
     summary["A13"] = "資料統計"
     summary["A14"] = "項目"
     summary["B14"] = ext_label

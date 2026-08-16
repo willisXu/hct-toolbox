@@ -134,7 +134,11 @@ def test_inventory_quantity_tolerance():
 
 
 def test_inventory_contract_reconcile_against_ns293():
-    """代工廠庫存核對報表 × NetSuite:只看 D 倉、排除合計列、單一數量欄當兩用。"""
+    """代工廠庫存核對報表 × NetSuite:排除合計列、單一數量欄當兩用。
+
+    倉別不再限定:E01 與 NetSuite 側的 G10 都照常核對，只有「合計／總計」
+    小計列(倉別與品號皆空白)仍列入排除數。
+    """
     contract = _spreadsheetml([
         ["庫存日期", "倉別", "倉別名稱", "品號", "品名", "批號", "庫存數量"],
         ["20260724", "D01", "凱芬妮倉", "300020400025", "品A", "", "100"],
@@ -154,22 +158,25 @@ def test_inventory_contract_reconcile_against_ns293():
     result = inventory.reconcile(ns293, "ns.xls", contract, "c.xls")
     assert result.ext_label == inventory.SYSTEM_CONTRACT
     assert result.output_name.startswith("代工廠庫存核對結果_")
-    # 代工廠側排除:合計/總計列 2 筆 + 非 D 倉 1 筆;NetSuite 側排除 G10 1 筆
-    assert result.hct_stats.excluded_rows == 3
-    assert result.ns_stats.excluded_rows == 1
+    # 代工廠側只剩合計/總計列 2 筆;NetSuite 側不再排除 G10
+    assert result.hct_stats.excluded_rows == 2
+    assert result.ns_stats.excluded_rows == 0
     assert result.anomalies == []
     by_item = {r["料號"]: r for r in result.item_rows}
     assert by_item["300020400025"]["代工廠 庫存數量"] == 100
     assert by_item["300020400025"]["總庫存差額"] == 10
     assert by_item["300020400025"]["狀態"] == inventory.STATUS_BOTH_DIFF
     assert by_item["300020400026"]["狀態"] == inventory.STATUS_MATCH
+    # 先前被倉別過濾掉的兩筆現在都會出現
+    assert by_item["300020400027"]["狀態"] == "僅 代工廠 存在"   # E01 倉
+    assert by_item["300020400028"]["狀態"] == inventory.STATUS_NS_ONLY  # G10 倉
     assert "僅 代工廠 存在" in result.statuses
 
 
 def test_inventory_ns_lot_format_reconcile_against_hct():
     """NetSuite 批號版 × HCT:倉別代碼直接當倉別、批號當效期、在庫數量兩用。
 
-    核對鍵是 倉別＋料號＋效期;非核准 G 倉(G15)要列入排除數而不是異常。
+    核對鍵是 倉別＋料號＋效期;倉別不限定，G15 這種倉別照常核對。
     """
     ns_lot = _spreadsheetml([
         ["料號", "品名", "倉別代碼", "倉別名稱", "批號", "在庫數量"],
@@ -189,9 +196,11 @@ def test_inventory_ns_lot_format_reconcile_against_hct():
 
     result = inventory.reconcile(ns_lot, "ns.xlsx", hct, "h.xls")
     assert result.ext_label == inventory.SYSTEM_HCT
-    assert result.ns_stats.valid_rows == 3
-    assert result.ns_stats.excluded_rows == 1   # G15 非核准倉
+    assert result.ns_stats.valid_rows == 4
+    assert result.ns_stats.excluded_rows == 0   # 不再因倉別排除 G15
     assert result.anomalies == []
+    by_location = {r["倉別"]: r for r in result.item_rows}
+    assert by_location["G15"]["狀態"] == inventory.STATUS_NS_ONLY
 
     # 明細鍵 = 倉別＋料號＋效期:同料號同倉別的兩個批號要分開兩列
     lots = [r for r in result.detail_rows if r["料號"] == "101021190002"]
@@ -271,11 +280,14 @@ def test_inventory_m00_location_variants_and_dash_expiry():
 
 
 def test_inventory_hct_reconcile_output_unchanged():
-    """原本的 HCT × NetSuite 流程不受新格式影響(欄名、檔名、狀態清單)。"""
+    """原本的 HCT × NetSuite 流程不受新格式影響(欄名、檔名、狀態清單)。
+
+    倉別不再限定:Z99 這種非 G 倉不再被排除，而是照常核對成「僅 HCT 存在」。
+    """
     hct = _spreadsheetml([
         ["儲區類別", "客戶產品編號", "有效日期", "可出數量", "庫存數量", "產品名稱"],
         ["G10", "SKU1", "20270501", "10", "12", "品A"],
-        ["Z99", "SKU2", "", "1", "1", "排除"],
+        ["Z99", "SKU2", "", "1", "1", "非G倉也要核對"],
     ])
     ns = _spreadsheetml([
         ["地點", "到期日", "DR_料號", "項目計數 總和", "數量 總和"],
@@ -285,9 +297,13 @@ def test_inventory_hct_reconcile_output_unchanged():
     assert result.ext_label == inventory.SYSTEM_HCT
     assert result.output_name.startswith("庫存核對結果_")
     assert result.statuses == inventory.ALL_STATUSES
-    assert result.hct_stats.excluded_rows == 1
-    assert result.item_rows[0]["HCT 可出數量"] == 10
-    assert result.item_rows[0]["狀態"] == inventory.STATUS_MATCH
+    assert result.hct_stats.excluded_rows == 0      # 不再因倉別排除任何列
+    assert result.hct_stats.valid_rows == 2
+    by_item = {r["料號"]: r for r in result.item_rows}
+    assert by_item["SKU1"]["HCT 可出數量"] == 10
+    assert by_item["SKU1"]["狀態"] == inventory.STATUS_MATCH
+    assert by_item["SKU2"]["倉別"] == "Z99"
+    assert by_item["SKU2"]["狀態"] == "僅 HCT 存在"
 
 
 # ------------------------------------------------------------------ 到貨日欄位比對
