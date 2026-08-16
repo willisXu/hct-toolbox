@@ -47,6 +47,8 @@ _HEADER_ALIASES = {
     "display name": "顯示名稱",
     "description": "說明",
     "memo": "備忘錄",
+    "memo (main)": "備忘錄 (主要)",
+    "transaction serial/lot number": "交易序號/批號",
     "quantity": "數量",
     "location": "地點",
     # 欄位內部 ID（saved search 沒設 Label 時回傳的值）

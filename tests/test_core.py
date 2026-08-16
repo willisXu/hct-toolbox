@@ -18,6 +18,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 from core import bundle_split
 from core import inventory
+from core import netsuite as netsuite_mod
 from core import compare as compare_mod
 from core import return_compare as return_compare_mod
 from core.compare import _normalize_customer, _normalize_order_id
@@ -316,6 +317,33 @@ def test_arrival_keyword_no_match_when_only_excluded():
 
 
 # ------------------------------------------------------------------ compare 正規化
+
+
+def test_netsuite_saved_search_english_headers_map_to_converter_names():
+    """saved search 沒設中文 Label 時回傳英文預設名稱,要譯成轉換認得的欄名。
+
+    欄名取自正式區實際回傳(調撥單未出貨明細 searchId=159):品名欄是
+    Display Name,過去不在對照表裡,轉出的商品名稱就整欄空白;批號與主要
+    備忘錄同樣是英文欄名。銷售訂單那支(customsearch517)欄名已是中文,
+    不受影響。
+    """
+    transfer_columns = [
+        "Internal ID", "Document Number", "Date", "DR_料號", "Display Name",
+        "Transaction Serial/Lot Number", "來源倉別", "目標倉別", "出貨數量",
+        "倉儲", "倉儲聯繫人", "倉儲電話", "倉儲地址", "Memo (Main)", "Item",
+        "來源地點", "目標地點", "DR_預計到貨日期", "DR_預計到貨時段",
+    ]
+    mapped = netsuite_mod._normalize_headers([transfer_columns])[0]
+    for want in ("內部 ID", "文件編號", "日期", "項目", "顯示名稱",
+                 "交易序號/批號", "備忘錄 (主要)"):
+        assert want in mapped, want
+    # shipping 的 MODE_TRANSFER 別名把「顯示名稱」接到「項目名稱」,品名才有值
+    assert "顯示名稱" in mapped and "Display Name" not in mapped
+
+    # 已是中文欄名的 saved search 不能被動到
+    order_columns = ["內部 ID", "文件編號", "日期", "DR_料號", "項目名稱",
+                     "交易序號/批號", "出貨客戶", "備忘錄", "項目"]
+    assert netsuite_mod._normalize_headers([order_columns])[0] == order_columns
 
 
 def test_compare_quantity_key_uses_normalized_expiry():
