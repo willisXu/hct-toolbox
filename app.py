@@ -500,6 +500,18 @@ with tab_netsuite:
 
             # 表格與單號只在「新抓一批」時重算，篩選/勾選重跑不必重建。
             ns_columns = _unique_columns(ns_rows[0])
+
+            # 品名欄漏抓時要講清楚，否則轉出的檔案品名整欄空白卻沒有任何提示。
+            # 常見原因：saved search 該欄沒設自訂 Label，RESTlet 只能回欄位內部
+            # ID（netsuite.py 的 _HEADER_ALIASES 已收常見寫法）；若欄名不在對照
+            # 表裡、或 saved search 根本沒加這欄，就得回 NetSuite 補。
+            if not any(name in ns_columns for name in ("項目名稱", "顯示名稱")):
+                st.warning(
+                    "這批資料裡找不到品名欄（需要「項目名稱」或「顯示名稱」），"
+                    "轉出的檔案品名會是空白。請到 NetSuite 確認這個 saved search "
+                    "有加品名欄位、並替它設定中文 Label。實際抓回來的欄名："
+                    + "、".join(str(c) for c in ns_columns)
+                )
             cache = st.session_state.get("ns_cache")
             if not cache or cache.get("seq") != fetch_seq:
                 cache = {
@@ -870,7 +882,7 @@ with tab_return:
     st.subheader("客戶退貨授權明細 × HCT 退貨入庫格式 核對")
     st.markdown(
         "上傳 **客戶退貨授權明細報表**（NetSuite RA）與 **HCT 退貨入庫格式** 各一份"
-        "（順序不限，程式會自動辨識），以「料號＋效期」加總數量核對退貨是否入庫。\n\n"
+        "（順序不限，程式會自動辨識），以「料號＋效期＋倉別」加總數量核對退貨是否入庫。\n\n"
         "兩邊沒有可以互相對應的單號欄位，因此不核對單號，只核對數量。"
     )
     col1, col2 = st.columns(2)
@@ -895,7 +907,7 @@ with tab_return:
 
     result = st.session_state.get("ret_result")
     if result:
-        st.success(f"核對完成！共 **{result.total_rows}** 筆料號＋效期組合。")
+        st.success(f"核對完成！共 **{result.total_rows}** 筆料號＋效期＋倉別組合。")
         metric_cols = st.columns(4)
         for idx, status in enumerate(["一致", "數量不符", "僅退貨授權", "僅入庫記錄"]):
             metric_cols[idx].metric(status, result.status_counts.get(status, 0))

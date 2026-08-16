@@ -18,6 +18,8 @@ sys.path.insert(0, str(BASE_DIR))
 
 from core import bundle_split
 from core import inventory
+from core import compare as compare_mod
+from core import return_compare as return_compare_mod
 from core.compare import _normalize_customer, _normalize_order_id
 from core import export_log
 from core import export_store
@@ -163,6 +165,59 @@ def test_inventory_contract_reconcile_against_ns293():
     assert "僅 代工廠 存在" in result.statuses
 
 
+def test_inventory_ns_lot_format_reconcile_against_hct():
+    """NetSuite 批號版 × HCT:倉別代碼直接當倉別、批號當效期、在庫數量兩用。
+
+    核對鍵是 倉別＋料號＋效期;非核准 G 倉(G15)要列入排除數而不是異常。
+    """
+    ns_lot = _spreadsheetml([
+        ["料號", "品名", "倉別代碼", "倉別名稱", "批號", "在庫數量"],
+        ["101021190002", "潔顏凝露50ML", "G10", "新竹-正常良品倉", "20290401", "7980"],
+        ["101021190002", "潔顏凝露50ML", "G10", "新竹-正常良品倉", "20290701", "20"],
+        ["101011280002", "卸妝凝露200ML", "G80", "新竹-待報廢倉", "20260701", "1"],
+        ["109000000001", "低效品", "G15", "新竹-低效良品倉", "20270301", "9"],
+    ])
+    assert inventory.detect_source(ns_lot, "ns.xlsx") == inventory.SYSTEM_NETSUITE_LOT
+
+    hct = _spreadsheetml([
+        ["儲區類別", "客戶產品編號", "產品名稱", "有效日期", "可出數量", "庫存數量"],
+        ["G10", "101021190002", "潔顏凝露50ML", "20290401", "7975", "7975"],
+        ["G10", "101021190002", "潔顏凝露50ML", "20290701", "20", "20"],
+        ["G80", "101011280002", "卸妝凝露200ML", "20260701", "1", "1"],
+    ])
+
+    result = inventory.reconcile(ns_lot, "ns.xlsx", hct, "h.xls")
+    assert result.ext_label == inventory.SYSTEM_HCT
+    assert result.ns_stats.valid_rows == 3
+    assert result.ns_stats.excluded_rows == 1   # G15 非核准倉
+    assert result.anomalies == []
+
+    # 明細鍵 = 倉別＋料號＋效期:同料號同倉別的兩個批號要分開兩列
+    lots = [r for r in result.detail_rows if r["料號"] == "101021190002"]
+    assert len(lots) == 2
+    by_expiry = {str(r["到期日"]): r for r in lots}
+    assert by_expiry["2029-04-01"]["NetSuite 數量"] == 7980
+    assert by_expiry["2029-04-01"]["總庫存差額"] == -5
+    assert by_expiry["2029-04-01"]["狀態"] == inventory.STATUS_BOTH_DIFF
+    assert by_expiry["2029-07-01"]["狀態"] == inventory.STATUS_MATCH
+
+    # 料號彙總層則把兩個批號加總成一列
+    by_item = {r["料號"]: r for r in result.item_rows}
+    assert by_item["101021190002"]["NetSuite 數量"] == 8000
+    # 在庫數量單欄兩用:可用量與總庫存量取同一個值
+    assert by_item["101011280002"]["NetSuite 項目計數"] == 1
+    assert by_item["101011280002"]["狀態"] == inventory.STATUS_MATCH
+
+
+def test_inventory_ns_lot_does_not_collide_with_contract_format():
+    """代工廠報表也有 倉別名稱／品名／批號,不可被誤判成 NetSuite 批號版。"""
+    contract = _spreadsheetml([
+        ["庫存日期", "倉別", "倉別名稱", "品號", "品名", "批號", "庫存數量"],
+        ["20260724", "D01", "凱芬妮倉", "300020400025", "品A", "", "100"],
+    ])
+    assert inventory.detect_source(contract, "c.xls") == inventory.SYSTEM_CONTRACT
+
+
 def test_inventory_m00_reconcile_sums_qty_plus_reserved():
     """M00 庫存詳情 × NetSuite：庫存量＝數量＋組合保留，整份視為 M00 倉。"""
     m00 = _spreadsheetml([
@@ -261,6 +316,64 @@ def test_arrival_keyword_no_match_when_only_excluded():
 
 
 # ------------------------------------------------------------------ compare 正規化
+
+
+def test_compare_quantity_key_uses_normalized_expiry():
+    """數量核對鍵＝客戶+料號+效期:兩邊效期寫法不同要視為同一組,不是兩筆假差異。
+
+    兩份來源都沒有倉別欄,所以鍵停在客戶層級(同料號同效期出給不同客戶
+    的量不能合併)。
+    """
+    unshipped = _spreadsheetml([
+        ["出貨客戶", "DR_料號", "交易序號/批號", "出貨數量", "客戶採購單編號"],
+        ["屈臣氏", "101021190002", "20270501", "10", "PO-1"],
+        ["寶雅", "101021190002", "20270501", "4", "PO-2"],
+    ])
+    delivery = _spreadsheetml([
+        ["客戶簡稱", "品號", "批號", "銷貨數量", "網路訂單編號"],
+        ["屈臣氏", "101021190002", "2027/5/1", "10", "PO-1"],
+        ["寶雅", "101021190002", "2027-05-01", "4", "PO-2"],
+    ])
+    result = compare_mod.compare(unshipped, "u.xls", delivery, "d.xls")
+    # 效期正規化前這裡會是 4 筆(每邊各自成組);正規化後兩邊對得上剩 2 筆
+    assert result.quantity_rows == 2
+    assert result.quantity_status_counts == {"一致": 2}
+
+
+def test_compare_unparseable_batches_stay_distinct():
+    """無法解析成日期的批號保留原文當鍵,不同批號不可被併成同一筆。"""
+    assert compare_mod._normalize_expiry("LOT-A")[0] != compare_mod._normalize_expiry("LOT-B")[0]
+    assert compare_mod._normalize_expiry("LOT-A")[0] == compare_mod._normalize_expiry("lot-a")[0]
+    # 空效期用空字串鍵:代表這列不在乎效期,兩邊的空效期列仍互相比對
+    assert compare_mod._normalize_expiry("") == ("", "")
+    assert compare_mod._normalize_expiry("20270501") == ("2027-05-01", "2027-05-01")
+
+
+def test_return_compare_key_includes_location():
+    """退貨核對鍵＝料號+效期+倉別:同料號同效期不同倉別要分開兩列。
+
+    RA 側倉別是「G10_新竹…」帶底線的地點字串,HCT 入庫是純代碼「G10」,
+    要取底線前段才對得上。
+    """
+    ra = _spreadsheetml([
+        ["文件編號", "客戶", "DR_料號", "交易序號/批號", "交易序號/批號數量", "倉別", "顯示名稱"],
+        ["RA-DW-1", "屈臣氏", "101021190002", "20270501", "10", "G10_新竹正常良品倉", "潔顏凝露"],
+        ["RA-DW-2", "屈臣氏", "101021190002", "20270501", "3", "G30_新竹瑕疵倉", "潔顏凝露"],
+    ])
+    hct = _spreadsheetml([
+        ["退貨單號", "產品編號", "效期", "數量", "儲區類別", "產品名稱"],
+        ["R1", "DR101021190002", "2027/5/1", "10", "G10", "潔顏凝露"],
+    ])
+    result = return_compare_mod.compare(ra, "ra.xls", hct, "h.xls")
+    # G10 兩邊對上、G30 只有退貨授權 → 2 筆而不是併成 1 筆
+    assert result.total_rows == 2
+    assert result.status_counts == {"一致": 1, "僅退貨授權": 1}
+
+
+def test_return_compare_location_normalizer():
+    assert return_compare_mod._normalize_location("g10_新竹正常良品倉") == "G10"
+    assert return_compare_mod._normalize_location(" G30 ") == "G30"
+    assert return_compare_mod._normalize_location(None) == ""
 
 
 def test_compare_normalizers():

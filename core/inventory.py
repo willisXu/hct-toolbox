@@ -2,6 +2,7 @@
 """HCT／代工廠／M00 × NetSuite 庫存核對(由 VBA modInventory* 模組移植)。
 
   - NetSuite 報表欄位：地點、到期日、DR_料號、項目計數 總和、數量 總和
+  - NetSuite 批號版報表欄位：料號、品名、倉別代碼、倉別名稱、批號、在庫數量
   - HCT 報表欄位：儲區類別、有效日期、客戶產品編號、可出數量、庫存數量
   - 代工廠報表欄位：庫存日期、倉別、品號、品名、批號、庫存數量
   - M00 報表(電商物流 InventorySummaryReport)：取「庫存詳情」分頁，
@@ -61,6 +62,12 @@ _NS293_HEADERS = ["地點", "到期日", "項目", "庫存數 總和"]
 # 物流核對版 NetSuite 庫存報表（663 格式）：料號用 DR_料號（空白時取「項目」
 # 底線前段），到期日在「庫存編號」欄，可用量=可用、總庫存量=在庫量。
 _NS663_HEADERS = ["項目", "DR_料號", "地點", "庫存編號", "在庫量", "可用"]
+# 批號版 NetSuite 庫存報表：倉別直接是代碼欄(G10、G80…，另有「倉別名稱」僅供
+# 參考不參與核對)，效期放「批號」欄(yyyymmdd)，只有一個「在庫數量」欄，同時
+# 當作可用量與總庫存量(同 293／代工廠)。核對鍵一樣是 倉別＋料號＋效期。
+# 必要欄位刻意不含「倉別名稱」：代工廠報表也有 倉別名稱／品名／批號，
+# 靠 料號＋倉別代碼＋在庫數量 三欄才能跟它區隔開，避免同時命中兩種格式。
+_NS_LOT_HEADERS = ["料號", "品名", "倉別代碼", "批號", "在庫數量"]
 _HCT_HEADERS = ["客戶產品編號", "有效日期", "儲區類別", "可出數量", "庫存數量"]
 # 代工廠庫存核對報表：只有一個「庫存數量」欄，同時當作可用量與總庫存量；
 # 「批號」放到期日欄位(目前多為空白＝無到期日)，「合計／總計」小計列會被排除。
@@ -75,6 +82,7 @@ _M00_NO_EXPIRY_MARKS = {"-", "—", "–", "‑", "－"}
 
 SYSTEM_NETSUITE_293 = "NetSuite293"
 SYSTEM_NETSUITE_663 = "NetSuite663"
+SYSTEM_NETSUITE_LOT = "NetSuite批號版"
 
 
 class InventoryError(ValueError):
@@ -195,6 +203,8 @@ def detect_source(data: bytes, filename: str) -> str:
         matches.append(SYSTEM_NETSUITE_663)
     if _find_matching_sheet(book, _NS293_HEADERS):
         matches.append(SYSTEM_NETSUITE_293)
+    if _find_matching_sheet(book, _NS_LOT_HEADERS):
+        matches.append(SYSTEM_NETSUITE_LOT)
     if _find_matching_sheet(book, _HCT_HEADERS):
         matches.append(SYSTEM_HCT)
     if _find_matching_sheet(book, _CONTRACT_HEADERS):
@@ -227,6 +237,8 @@ def _import_source(data: bytes, filename: str, system: str,
         required = _NS293_HEADERS
     elif system == SYSTEM_NETSUITE_663:
         required = _NS663_HEADERS
+    elif system == SYSTEM_NETSUITE_LOT:
+        required = _NS_LOT_HEADERS
     else:
         required = _NS_HEADERS
     match = _find_matching_sheet(book, required)
@@ -267,6 +279,12 @@ def _import_source(data: bytes, filename: str, system: str,
         desc_col = col("項目")
         field_names = ("地點", "項目", "到期日", "庫存數 總和", "庫存數 總和")
         strip_item_suffix = True
+    elif system == SYSTEM_NETSUITE_LOT:
+        location_col, item_col = col("倉別代碼"), col("料號")
+        expiry_col = col("批號")
+        available_col = total_col = col("在庫數量")
+        desc_col = col("品名")
+        field_names = ("倉別代碼", "料號", "批號", "在庫數量", "在庫數量")
     elif system == SYSTEM_NETSUITE_663:
         location_col, item_col = col("地點"), col("DR_料號")
         expiry_col, available_col, total_col = col("庫存編號"), col("可用"), col("在庫量")
@@ -451,7 +469,8 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
         raise InventoryError(
             f"無法辨識檔案:{hct_name}(找不到 NetSuite、HCT、代工廠或 M00 報表的必要欄位)")
 
-    ns_variants = (SYSTEM_NETSUITE, SYSTEM_NETSUITE_293, SYSTEM_NETSUITE_663)
+    ns_variants = (SYSTEM_NETSUITE, SYSTEM_NETSUITE_293, SYSTEM_NETSUITE_663,
+                   SYSTEM_NETSUITE_LOT)
     ext_variants = (SYSTEM_HCT, SYSTEM_CONTRACT, SYSTEM_M00)
     if first_system in ext_variants and second_system in ns_variants:
         ns_data, hct_data = hct_data, ns_data

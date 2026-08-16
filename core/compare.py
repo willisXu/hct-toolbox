@@ -2,7 +2,9 @@
 """HCT 表格核對工具（由 VBA modHCTCompareTool 移植）。
 
 比對「未出貨明細」與「銷貨單明細」兩份表格：
-  - 數量核對：以 客戶+料號+批號 為鍵，加總兩邊數量比差異。
+  - 數量核對：以 客戶+料號+效期 為鍵，加總兩邊數量比差異。兩份來源都沒有
+    倉別欄位，所以這裡的鍵留在客戶層級（同料號同效期出給不同客戶的量不能
+    合併）；效期取自批號欄，空白代表這列不在乎效期，仍會互相比對。
   - 訂單編號核對：以標準化訂單編號（取 - 前段）為鍵，比對兩邊出現情況。
 兩份檔案順序不限，程式依欄位自動辨識類型。
 """
@@ -12,7 +14,14 @@ import io
 from dataclasses import dataclass
 from datetime import datetime
 
-from .xlio import build_header_map, first_sheet, is_excel_error_text, normalize_number, read_workbook
+from .xlio import (
+    build_header_map,
+    first_sheet,
+    is_excel_error_text,
+    normalize_number,
+    read_workbook,
+    try_parse_date,
+)
 
 SOURCE_UNSHIPPED = "UNSHIPPED"
 SOURCE_DELIVERY = "DELIVERY"
@@ -117,6 +126,24 @@ def _normalize_order_id(value: object) -> str:
     return text
 
 
+def _normalize_expiry(value: object) -> tuple[str, str]:
+    """批號欄即效期字串，回傳 (比對用 key, 顯示用文字)（同 return_compare）。
+
+    兩份報表的同一個效期常寫成不同格式（20270501 / 2027-05-01 / 2027/5/1），
+    直接拿原文當鍵會把同一批貨拆成兩列、雙雙變成「僅一邊有」的假差異。
+    無法辨識為日期的批號保留原文（casefold 後加 raw: 前綴），不同批號不會
+    被誤併；空白效期用空字串鍵，代表這列不在乎效期。
+    """
+    text = _normalize_text(value)
+    if not text:
+        return "", ""
+    parsed = try_parse_date(value)
+    if parsed:
+        display = parsed.strftime("%Y-%m-%d")
+        return display, display
+    return f"raw:{text.casefold()}", text
+
+
 def _cell(rows: list, row_index: int, headers: dict, name: str) -> object:
     index = headers.get(name.casefold())
     if index is None:
@@ -162,13 +189,14 @@ def _build_quantity_compare(unshipped, un_headers, delivery, de_headers) -> list
         for row_index in range(1, len(rows)):
             customer = _normalize_customer(_cell(rows, row_index, headers, customer_h))
             item = _normalize_text(_cell(rows, row_index, headers, item_h))
-            batch = _normalize_text(_cell(rows, row_index, headers, batch_h))
+            expiry_key, expiry_display = _normalize_expiry(
+                _cell(rows, row_index, headers, batch_h))
             quantity = normalize_number(_cell(rows, row_index, headers, qty_h))
-            if not (customer or item or batch):
+            if not (customer or item or expiry_display):
                 continue
-            key = (customer.casefold(), item.casefold(), batch.casefold())
+            key = (customer.casefold(), item.casefold(), expiry_key)
             record = records.setdefault(key, {
-                "客戶": customer, "料號": item, "批號": batch,
+                "客戶": customer, "料號": item, "效期": expiry_display,
                 "未出貨數量": 0.0, "銷貨數量": 0.0,
             })
             record[field] += quantity
@@ -248,7 +276,7 @@ def _count_statuses(rows: list[dict]) -> dict:
 
 # ------------------------------------------------------------------ 輸出
 
-_QUANTITY_COLUMNS = ["客戶", "料號", "批號", "未出貨數量", "銷貨數量", "差異(未出貨-銷貨)", "狀態"]
+_QUANTITY_COLUMNS = ["客戶", "料號", "效期", "未出貨數量", "銷貨數量", "差異(未出貨-銷貨)", "狀態"]
 _ORDER_COLUMNS = [
     "標準化訂單編號", "未出貨原始編號", "銷貨單原始編號", "未出貨客戶", "銷貨單客戶",
     "未出貨筆數", "銷貨單筆數", "未出貨數量", "銷貨數量", "差異(未出貨-銷貨)", "狀態",

@@ -33,11 +33,30 @@ class NetSuiteError(ValueError):
 # saved search 欄位若沒有在 NetSuite 設定自訂 Label，search.load() 回傳的
 # col.label 會是該欄位的英文預設名稱，跟手動匯出檔案的中文欄名對不上
 # （既有轉換邏輯認的是中文欄名）。這裡把常見的英文預設名稱轉成對應中文欄名。
+#
+# RESTlet 取的是 `col.label || col.name`，所以連 Label 都沒有時回來的會是
+# 欄位「內部 ID」（displayname、salesdescription…）而不是英文名稱，兩種寫法
+# 都要收：品名欄就是這樣漏掉的——shipping 轉換認「項目名稱／顯示名稱」，
+# 但抓回來的欄名是 displayname，對不上就整欄空白。
 _HEADER_ALIASES = {
+    # 英文預設名稱
     "document number": "文件編號",
     "date": "日期",
     "internal id": "內部 ID",
     "item": "項目",
+    "display name": "顯示名稱",
+    "description": "說明",
+    "memo": "備忘錄",
+    "quantity": "數量",
+    "location": "地點",
+    # 欄位內部 ID（saved search 沒設 Label 時回傳的值）
+    "tranid": "文件編號",
+    "trandate": "日期",
+    "internalid": "內部 ID",
+    "itemid": "項目",
+    "displayname": "顯示名稱",
+    "salesdescription": "說明",
+    "memomain": "備忘錄 (主要)",
 }
 
 

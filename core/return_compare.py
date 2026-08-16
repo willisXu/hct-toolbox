@@ -6,12 +6,15 @@
 兩份檔案順序不限，程式依欄位自動辨識類型。
 
 兩邊都沒有可以互相對應的單號欄位（RA 是 RA-DW-xxx 的授權單號，入庫格式
-是倉儲自訂的收貨批次代號，兩者無法對應），所以用「料號＋效期」加總數量
+是倉儲自訂的收貨批次代號，兩者無法對應），所以用「料號＋效期＋倉別」加總數量
 比較，比對邏輯與 compare.py 的數量核對一致：
   - RA 明細：DR_料號 ＋ 交易序號/批號（此欄位本身即效期字串）；運費等
     非品項明細列 DR_料號空白，予以排除。
   - HCT 入庫：產品編號（開頭常見「DR」前綴，需與 RA 的 DR_料號對齊）
-    ＋ 效期。
+    ＋ 效期 ＋ 儲區類別（對應 RA 的倉別）。
+  - 倉別取代碼本身（RA 側常是「G10_新竹…」這種帶底線的地點字串，取底線
+    前段），兩邊都轉大寫後比對；效期空白時仍以空字串成組，代表「這列不
+    在乎效期」，不會被丟掉。
 """
 from __future__ import annotations
 
@@ -136,6 +139,18 @@ def _strip_dr_prefix(text: str) -> str:
     return text
 
 
+def _normalize_location(value: object) -> str:
+    """倉別正規化：轉大寫、取底線前段（同 inventory._normalize_location）。
+
+    RA 明細的倉別常是「G10_新竹正常良品倉」，HCT 入庫格式的儲區類別則是
+    純代碼「G10」；不取底線前段兩邊永遠對不上。
+    """
+    text = normalize_text(value).upper()
+    if "_" in text:
+        text = text.split("_", 1)[0]
+    return text.strip()
+
+
 def _normalize_expiry(value: object) -> tuple[str, str]:
     """回傳 (比對用 key, 顯示用文字)。
 
@@ -159,10 +174,11 @@ def _normalize_expiry(value: object) -> tuple[str, str]:
 def _build_compare(ra_rows, ra_headers, hct_rows, hct_headers) -> list[dict]:
     records: dict[tuple, dict] = {}
 
-    def get_record(material: str, expiry_key: str, expiry_display: str, name: str) -> dict:
-        key = (material.casefold(), expiry_key)
+    def get_record(material: str, expiry_key: str, expiry_display: str, name: str,
+                   location: str) -> dict:
+        key = (material.casefold(), expiry_key, location)
         record = records.setdefault(key, {
-            "料號": material, "品名": name, "效期": expiry_display,
+            "料號": material, "品名": name, "效期": expiry_display, "倉別": location,
             "退貨授權數量": 0.0, "入庫數量": 0.0,
         })
         if not record["品名"] and name:
@@ -176,7 +192,8 @@ def _build_compare(ra_rows, ra_headers, hct_rows, hct_headers) -> list[dict]:
         expiry_key, expiry_display = _normalize_expiry(_cell(ra_rows, row_index, ra_headers, "交易序號/批號"))
         quantity = normalize_number(_cell(ra_rows, row_index, ra_headers, "交易序號/批號數量"))
         name = normalize_text(_cell(ra_rows, row_index, ra_headers, "顯示名稱"))
-        record = get_record(material, expiry_key, expiry_display, name)
+        location = _normalize_location(_cell(ra_rows, row_index, ra_headers, "倉別"))
+        record = get_record(material, expiry_key, expiry_display, name, location)
         record["退貨授權數量"] += quantity
 
     for row_index in range(1, len(hct_rows)):
@@ -186,7 +203,8 @@ def _build_compare(ra_rows, ra_headers, hct_rows, hct_headers) -> list[dict]:
         expiry_key, expiry_display = _normalize_expiry(_cell(hct_rows, row_index, hct_headers, "效期"))
         quantity = normalize_number(_cell(hct_rows, row_index, hct_headers, "數量"))
         name = normalize_text(_cell(hct_rows, row_index, hct_headers, "產品名稱"))
-        record = get_record(material, expiry_key, expiry_display, name)
+        location = _normalize_location(_cell(hct_rows, row_index, hct_headers, "儲區類別"))
+        record = get_record(material, expiry_key, expiry_display, name, location)
         record["入庫數量"] += quantity
 
     result = []
@@ -202,7 +220,7 @@ def _build_compare(ra_rows, ra_headers, hct_rows, hct_headers) -> list[dict]:
         else:
             record["狀態"] = "數量不符"
         result.append(record)
-    result.sort(key=lambda r: (r["料號"], r["效期"]))
+    result.sort(key=lambda r: (r["料號"], r["效期"], r["倉別"]))
     return result
 
 
@@ -215,7 +233,8 @@ def _count_statuses(rows: list[dict]) -> dict:
 
 # ------------------------------------------------------------------ 輸出
 
-_DETAIL_COLUMNS = ["料號", "品名", "效期", "退貨授權數量", "入庫數量", "差異(授權-入庫)", "狀態"]
+_DETAIL_COLUMNS = ["料號", "品名", "效期", "倉別", "退貨授權數量", "入庫數量",
+                   "差異(授權-入庫)", "狀態"]
 
 
 def _write_output(name1: str, name2: str, detail_rows: list) -> bytes:
