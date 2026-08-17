@@ -34,6 +34,7 @@ from core.shipping import (
     MEMO_SOURCE_MAIN,
     MERGE_BY_PURCHASE_ORDER,
     MODE_ORDER,
+    MODE_TRANSFER,
     _match_arrival_by_keyword,
     _normalize_arrival,
     _normalize_expiry as ship_normalize_expiry,
@@ -630,6 +631,63 @@ def test_e2e_warehouse_display_material_falls_back_to_g90():
     assert _output_cell(result, 2, 30) == "G10"   # 一般料號沿用範本預設
     assert _output_cell(result, 3, 30) == "G90"
     assert any("902126060002" in w and "G90" in w for w in result.warnings)
+
+
+def test_e2e_warehouse_reads_netsuite_transfer_source_location_columns():
+    """調撥單直接抓取:虛擬倉要吃 saved search 的「來源倉別」,不能落回 G10。
+
+    欄名取自正式區實際回傳(調撥單未出貨明細 searchId=159)。過去
+    _WAREHOUSE_ALIASES 只認「倉別」「地點」,「來源倉別」「來源地點」都對不上,
+    整批默默填成範本預設值 G10,跟 NetSuite 上選的來源倉不一致。
+    「目標倉別/目標地點」是收貨端,不可以被拿來當虛擬倉。
+    """
+    header = [
+        "內部 ID", "文件編號", "日期", "DR_料號", "顯示名稱", "交易序號/批號",
+        "來源倉別", "目標倉別", "出貨數量", "倉儲", "倉儲聯繫人", "倉儲電話",
+        "倉儲地址", "備忘錄 (主要)", "項目", "來源地點", "目標地點",
+        "DR_預計到貨日期", "DR_預計到貨時段",
+    ]
+
+    def row(material, qty, source_wh, source_loc):
+        return [
+            "1", "TO-1", "2026-08-01", material, "品名A", "2027-05-01",
+            source_wh, "G10 新竹倉", qty, "門市A", "聯絡人", "0912345678",
+            "10041台北市中正區路1號", "", material + "_X", source_loc,
+            "客戶A", "2026-08-05", "早(9-12)",
+        ]
+
+    rows = [
+        header,
+        row("SKU001", 10, "G30 台北倉", "G30_台北倉"),
+        # 「來源倉別」空白時要退到「來源地點」,不是直接放棄改用範本值
+        row("SKU002", 5, "", "G80_桃園倉"),
+    ]
+    result = shipping_convert_rows(rows, MODE_TRANSFER, TEMPLATE_PATH)
+    assert _output_cell(result, 2, 30) == "G30"
+    assert _output_cell(result, 3, 30) == "G80"
+    assert not any("沒有倉別欄" in w for w in result.warnings)
+
+
+def test_e2e_warns_when_warehouse_cell_is_blank():
+    """有倉別欄、但該列空白時也要警告一次(同樣會靜默變成 G10)。"""
+    header = _E2E_HEADER + ["倉別"]
+    filled = _e2e_row("2027-05-01", 10) + ["G30 出貨倉"]
+    blank = _e2e_row("2027-06-01", 5) + [""]
+    result = shipping_convert_rows([header, filled, blank], MODE_ORDER, TEMPLATE_PATH)
+    assert _output_cell(result, 2, 30) == "G30"
+    assert _output_cell(result, 3, 30) == "G10"
+    blank_warnings = [w for w in result.warnings if "倉別欄是空白" in w]
+    assert len(blank_warnings) == 1   # 同一則訊息不重複洗版
+    assert not any("沒有倉別欄" in w for w in result.warnings)
+
+
+def test_e2e_warns_when_source_has_no_warehouse_column():
+    """整份報表都沒有倉別欄時要警告一次,否則虛擬倉整批默默變成 G10。"""
+    result = shipping_convert_rows(
+        [_E2E_HEADER, _e2e_row("2027-05-01", 10)], MODE_ORDER, TEMPLATE_PATH
+    )
+    assert _output_cell(result, 2, 30) == "G10"
+    assert any("沒有倉別欄" in w and "G10" in w for w in result.warnings)
 
 
 # ------------------------------------------------------------------ ED 訂單拆解

@@ -6,9 +6,10 @@
      同收件條件有 >=2 種訂單類型且含「一般銷售訂單」時合併為一張送貨單。
   2. 同送貨單內相同「料號 + 效期」的明細數量加總。
   3. 輸出 36 欄 HCT 銷貨報表（欄位常數取自 HCT範本）。
-  4. 虛擬倉（AD 欄）：來源報表有倉別/地點欄時逐列帶出 G 開頭代碼；
+  4. 虛擬倉（AD 欄）：來源報表有倉別/地點/來源倉別欄時逐列帶出 G 開頭代碼；
      沒有該欄（或該列空白）時，料號 9 開頭（陳列/宣傳品，存 G90 倉）
-     輸出 G90 並附警告，其餘沿用範本預設值（G10）。
+     輸出 G90 並附警告，其餘沿用範本預設值（G10）；整份報表沒有倉別欄、
+     或欄位存在但該列空白時各另外警告一次（否則默默變成 G10）。
   5. 備忘錄來源可選「明細行（備忘錄）」或「主要（備忘錄 (主要)）」；
      明細行備忘錄內容與該列品名相同時（2026-08 新版報表 NetSuite
      會回填品名）視為系統雜訊，不併入備註。
@@ -84,8 +85,16 @@ _ALIASES = {
 }
 
 # 虛擬倉（輸出第 30 欄）逐列判斷用：來源報表的倉別/地點候選欄名（非必要欄位），
-# 依序取第一個存在的欄。欄位值只要含 G+兩碼數字（如「G10」「G30 出貨倉」）即可辨識。
-_WAREHOUSE_ALIASES = ("虛擬倉", "倉別", "地點", "出貨倉", "出貨地點")
+# 依序取第一個「有值」的欄。欄位值只要含 G+兩碼數字（如「G10」「G30 出貨倉」）即可辨識。
+#
+# 「來源倉別」「來源地點」是 NetSuite 調撥單 saved search（未出貨明細）實際回傳的
+# 欄名：出貨是從來源倉出的，虛擬倉要吃這兩欄。過去只認「倉別」「地點」，
+# 調撥單直接抓取整批對不上、虛擬倉全部落回範本預設值 G10，跟 NetSuite 上
+# 選的來源倉不一致。「目標倉別」「目標地點」是收貨端，刻意不列入。
+_WAREHOUSE_ALIASES = (
+    "虛擬倉", "倉別", "來源倉別", "出貨倉", "出貨倉別",
+    "地點", "來源地點", "出貨地點",
+)
 _WAREHOUSE_CODE_RE = re.compile(r"G\d{2}")
 # 料號 9 開頭為陳列/宣傳品（如 902126060002 POYA 陳列物），實際存放 G90 倉。
 _DISPLAY_MATERIAL_PREFIX = "9"
@@ -171,6 +180,16 @@ def convert_rows(
     missing = [h for h in _REQUIRED_HEADERS[mode] if h.casefold() not in headers]
     if missing:
         raise ConvertError("來源檔缺少必要欄位：\n" + "\n".join(f"- {h}" for h in missing))
+
+    if not _has_warehouse_column(headers):
+        # 沒有倉別欄時虛擬倉整批落回範本預設值（G10），過去完全沒有提示，
+        # 出貨倉不是 G10 的單就這樣悄悄出錯，這裡明講一次。
+        alias_notes.append(
+            "來源報表沒有倉別欄（可用欄名："
+            + "、".join(_WAREHOUSE_ALIASES)
+            + "），虛擬倉一律使用範本預設值 G10（料號 9 開頭仍輸出 G90）；"
+            "出貨倉不是 G10 時請在 saved search／匯出報表補上來源倉別欄。"
+        )
 
     state = _build_shipments(rows, headers, mode, merge_by)
     state["warnings"] = alias_notes + state["warnings"]
@@ -374,27 +393,48 @@ def _batch_status_warning(row: list, headers: dict[str, int], row_number: int) -
     return ""
 
 
+def _has_warehouse_column(headers: dict[str, int]) -> bool:
+    return any(name.casefold() in headers for name in _WAREHOUSE_ALIASES)
+
+
 def _resolve_warehouse(row: list, headers: dict[str, int], material: str) -> tuple[str, str]:
     """判斷該列的虛擬倉，回傳 (倉別代碼, 警告)。
 
     代碼空字串表示交由範本預設值（G10）決定。來源有倉別/地點欄時以欄位值
     為準；沒有該欄或該列空白時退回料號規則（9 開頭 → G90）。
+
+    候選欄依 _WAREHOUSE_ALIASES 的順序全部看過，取第一個「有值」的欄——
+    調撥單報表同時有「來源倉別」與「來源地點」，只看第一個存在的欄時，
+    那一欄剛好空白就會漏掉另一欄已經填好的倉別。
     """
+    has_column = False
+    unreadable = ""
     for name in _WAREHOUSE_ALIASES:
         if name.casefold() not in headers:
             continue
+        has_column = True
         raw = normalize_text(_cell(row, headers, name))
-        if raw:
-            matched = _WAREHOUSE_CODE_RE.search(raw.upper())
-            if matched:
-                return matched.group(0), ""
-            return "", f"倉別「{raw}」無法辨識出 G 開頭倉別代碼，虛擬倉改用範本預設值。"
-        break
+        if not raw:
+            continue
+        matched = _WAREHOUSE_CODE_RE.search(raw.upper())
+        if matched:
+            return matched.group(0), ""
+        if not unreadable:
+            unreadable = f"倉別「{raw}」無法辨識出 G 開頭倉別代碼，虛擬倉改用範本預設值。"
+    if unreadable:
+        return "", unreadable
     if material.startswith(_DISPLAY_MATERIAL_PREFIX):
         return (
             DISPLAY_MATERIAL_WAREHOUSE,
             f"料號 {material} 為 9 開頭（陳列/宣傳品），"
             f"虛擬倉輸出 {DISPLAY_MATERIAL_WAREHOUSE}，請確認。",
+        )
+    if has_column:
+        # 有倉別欄卻整列空白也是靜默變 G10（跟「整份沒有倉別欄」同一種錯法），
+        # 訊息刻意不帶列號，讓 _add_distinct 收斂成一則、不洗版。
+        return "", (
+            "有明細列的倉別欄是空白，這些列的虛擬倉改用範本預設值 G10"
+            "（料號 9 開頭仍輸出 G90），請確認來源倉別是不是漏填。"
         )
     return "", ""
 
