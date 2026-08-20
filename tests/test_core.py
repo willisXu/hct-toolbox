@@ -106,9 +106,12 @@ def test_return_expiry_same_text_matches_but_distinct_stays_apart():
     assert ret_normalize_expiry("待確認批號B")[0] == ret_normalize_expiry("待確認批號b")[0]
     # 不同文字不能落到同一 key
     assert ret_normalize_expiry("待確認批號B")[0] != ret_normalize_expiry("效期未確認")[0]
-    # 可解析日期輸出 YYYY-MM-DD
-    assert ret_normalize_expiry("20270501") == ("2027-05-01", "2027-05-01")
-    assert ret_normalize_expiry(None) == ("", "")
+    # 可解析日期輸出 (key, 效期 YYYY-MM-DD, 批號 yyyymmdd)
+    assert ret_normalize_expiry("20270501") == ("2027-05-01", "2027-05-01", "20270501")
+    assert ret_normalize_expiry("2027/5/1") == ("2027-05-01", "2027-05-01", "20270501")
+    # 無法解析的批號:效期與批號都照抄原文
+    assert ret_normalize_expiry("LOT-A")[1:] == ("LOT-A", "LOT-A")
+    assert ret_normalize_expiry(None) == ("", "", "")
 
 
 # ------------------------------------------------------------------ inventory
@@ -390,8 +393,11 @@ def test_compare_unparseable_batches_stay_distinct():
     assert compare_mod._normalize_expiry("LOT-A")[0] != compare_mod._normalize_expiry("LOT-B")[0]
     assert compare_mod._normalize_expiry("LOT-A")[0] == compare_mod._normalize_expiry("lot-a")[0]
     # 空效期用空字串鍵:代表這列不在乎效期,兩邊的空效期列仍互相比對
-    assert compare_mod._normalize_expiry("") == ("", "")
-    assert compare_mod._normalize_expiry("20270501") == ("2027-05-01", "2027-05-01")
+    assert compare_mod._normalize_expiry("") == ("", "", "")
+    # (key, 效期 YYYY-MM-DD, 批號 yyyymmdd)
+    assert compare_mod._normalize_expiry("20270501") == ("2027-05-01", "2027-05-01", "20270501")
+    assert compare_mod._normalize_expiry("2027/5/1") == ("2027-05-01", "2027-05-01", "20270501")
+    assert compare_mod._normalize_expiry("LOT-A")[1:] == ("LOT-A", "LOT-A")
 
 
 def test_return_compare_key_includes_location():
@@ -413,6 +419,73 @@ def test_return_compare_key_includes_location():
     # G10 兩邊對上、G30 只有退貨授權 → 2 筆而不是併成 1 筆
     assert result.total_rows == 2
     assert result.status_counts == {"一致": 1, "僅退貨授權": 1}
+
+
+def test_compare_result_keeps_batch_column():
+    """數量核對結果要留批號欄:效期給 yyyy-mm-dd,批號給 yyyymmdd 原始寫法。"""
+    unshipped = _spreadsheetml([
+        ["出貨客戶", "DR_料號", "交易序號/批號", "出貨數量", "客戶採購單編號"],
+        ["屈臣氏", "101021190002", "20270501", "10", "PO-1"],
+        ["屈臣氏", "101021190003", "LOT-A", "2", "PO-1"],
+    ])
+    delivery = _spreadsheetml([
+        ["客戶簡稱", "品號", "批號", "銷貨數量", "網路訂單編號"],
+        ["屈臣氏", "101021190002", "2027/5/1", "10", "PO-1"],
+    ])
+    result = compare_mod.compare(unshipped, "u.xls", delivery, "d.xls")
+    assert "批號" in compare_mod._QUANTITY_COLUMNS
+    rows = _read_sheet_rows(result.output_bytes, "數量核對")
+    header = rows[0]
+    batch_col = header.index("批號")
+    by_item = {r[header.index("料號")]: r for r in rows[1:]}
+    assert by_item["101021190002"][header.index("效期")] == "2027-05-01"
+    assert by_item["101021190002"][batch_col] == "20270501"   # 文字,不是 20270501 數字
+    assert by_item["101021190003"][batch_col] == "LOT-A"
+
+
+def test_return_compare_result_keeps_batch_column():
+    ra = _spreadsheetml([
+        ["文件編號", "客戶", "DR_料號", "交易序號/批號", "交易序號/批號數量", "倉別", "顯示名稱"],
+        ["RA-DW-1", "屈臣氏", "101021190002", "20270501", "10", "G10_新竹正常良品倉", "潔顏凝露"],
+    ])
+    hct = _spreadsheetml([
+        ["退貨單號", "產品編號", "效期", "數量", "儲區類別", "產品名稱"],
+        ["R1", "DR101021190002", "2027/5/1", "10", "G10", "潔顏凝露"],
+    ])
+    result = return_compare_mod.compare(ra, "ra.xls", hct, "h.xls")
+    rows = _read_sheet_rows(result.output_bytes, "退貨核對明細")
+    header = rows[0]
+    assert rows[1][header.index("效期")] == "2027-05-01"
+    assert rows[1][header.index("批號")] == "20270501"
+
+
+def test_inventory_detail_keeps_batch_column():
+    """日期明細留批號欄(yyyymmdd 文字);料號彙總沒有到期日,也不該有批號欄。"""
+    ns_lot = _spreadsheetml([
+        ["料號", "品名", "倉別代碼", "倉別名稱", "批號", "在庫數量"],
+        ["101021190002", "潔顏凝露50ML", "G10", "新竹-正常良品倉", "20290401", "20"],
+        ["109000000002", "無到期日贈品", "G10", "新竹-正常良品倉", "", "5"],
+    ])
+    hct = _spreadsheetml([
+        ["儲區類別", "客戶產品編號", "產品名稱", "有效日期", "可出數量", "庫存數量"],
+        ["G10", "101021190002", "潔顏凝露50ML", "2029/4/1", "20", "20"],
+        ["G10", "109000000002", "無到期日贈品", "", "5", "5"],
+    ])
+    result = inventory.reconcile(ns_lot, "ns.xlsx", hct, "h.xls")
+    by_item = {r["料號"]: r for r in result.detail_rows}
+    assert by_item["101021190002"]["批號"] == "20290401"
+    assert by_item["109000000002"]["批號"] == "無到期日"
+    assert "批號" not in result.item_rows[0]
+
+    rows = _read_sheet_rows(result.output_bytes, "日期明細")
+    header = rows[0]
+    assert header.index("批號") == header.index("到期日") + 1
+    detail = {r[header.index("料號")]: r for r in rows[1:]}
+    assert detail["101021190002"][header.index("批號")] == "20290401"
+    item_header = _read_sheet_rows(result.output_bytes, "料號彙總")[0]
+    assert "批號" not in item_header
+    # 狀態欄位置隨新欄往後移,底色仍要標在狀態欄上
+    assert header.index("狀態") == len(header) - 4
 
 
 def test_return_compare_location_normalizer():
@@ -825,6 +898,16 @@ def _spreadsheetml(rows: list[list[str]]) -> bytes:
         '<Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'
         f'<ss:Worksheet ss:Name="S1"><ss:Table>{cells}</ss:Table></ss:Worksheet></Workbook>'
     ).encode("utf-8")
+
+
+def _read_sheet_rows(output_bytes: bytes, sheet_name: str) -> list[list]:
+    """讀輸出檔某個分頁的所有列（含欄位列），供欄位/格式的回歸檢查。"""
+    import io as _io
+
+    import openpyxl
+
+    wb = openpyxl.load_workbook(_io.BytesIO(output_bytes))
+    return [list(row) for row in wb[sheet_name].iter_rows(values_only=True)]
 
 
 # ------------------------------------------------------------------ table_filter

@@ -4,7 +4,8 @@
 比對「未出貨明細」與「銷貨單明細」兩份表格：
   - 數量核對：以 客戶+料號+效期 為鍵，加總兩邊數量比差異。兩份來源都沒有
     倉別欄位，所以這裡的鍵留在客戶層級（同料號同效期出給不同客戶的量不能
-    合併）；效期取自批號欄，空白代表這列不在乎效期，仍會互相比對。
+    合併）；效期取自批號欄，空白代表這列不在乎效期，仍會互相比對。輸出同時
+    保留「批號」欄（yyyymmdd 原始寫法，文字格式），方便回頭查來源批號。
   - 訂單編號核對：以標準化訂單編號（取 - 前段）為鍵，比對兩邊出現情況。
 兩份檔案順序不限，程式依欄位自動辨識類型。
 """
@@ -126,22 +127,25 @@ def _normalize_order_id(value: object) -> str:
     return text
 
 
-def _normalize_expiry(value: object) -> tuple[str, str]:
-    """批號欄即效期字串，回傳 (比對用 key, 顯示用文字)（同 return_compare）。
+def _normalize_expiry(value: object) -> tuple[str, str, str]:
+    """批號欄即效期字串，回傳 (比對用 key, 效期顯示, 批號顯示)（同 return_compare）。
 
     兩份報表的同一個效期常寫成不同格式（20270501 / 2027-05-01 / 2027/5/1），
     直接拿原文當鍵會把同一批貨拆成兩列、雙雙變成「僅一邊有」的假差異。
     無法辨識為日期的批號保留原文（casefold 後加 raw: 前綴），不同批號不會
     被誤併；空白效期用空字串鍵，代表這列不在乎效期。
+
+    批號顯示＝可解析日期時的 yyyymmdd（倉儲/NetSuite 的批號寫法），無法解析
+    時照抄原文；輸出時寫成文字格式，Excel 才不會把 20270501 轉成數字或日期。
     """
     text = _normalize_text(value)
     if not text:
-        return "", ""
+        return "", "", ""
     parsed = try_parse_date(value)
     if parsed:
         display = parsed.strftime("%Y-%m-%d")
-        return display, display
-    return f"raw:{text.casefold()}", text
+        return display, display, parsed.strftime("%Y%m%d")
+    return f"raw:{text.casefold()}", text, text
 
 
 def _cell(rows: list, row_index: int, headers: dict, name: str) -> object:
@@ -189,16 +193,18 @@ def _build_quantity_compare(unshipped, un_headers, delivery, de_headers) -> list
         for row_index in range(1, len(rows)):
             customer = _normalize_customer(_cell(rows, row_index, headers, customer_h))
             item = _normalize_text(_cell(rows, row_index, headers, item_h))
-            expiry_key, expiry_display = _normalize_expiry(
+            expiry_key, expiry_display, batch = _normalize_expiry(
                 _cell(rows, row_index, headers, batch_h))
             quantity = normalize_number(_cell(rows, row_index, headers, qty_h))
             if not (customer or item or expiry_display):
                 continue
             key = (customer.casefold(), item.casefold(), expiry_key)
             record = records.setdefault(key, {
-                "客戶": customer, "料號": item, "效期": expiry_display,
+                "客戶": customer, "料號": item, "效期": expiry_display, "批號": batch,
                 "未出貨數量": 0.0, "銷貨數量": 0.0,
             })
+            if not record["批號"] and batch:
+                record["批號"] = batch
             record[field] += quantity
 
     accumulate(unshipped, un_headers, "出貨客戶", "DR_料號", "交易序號/批號", "出貨數量", "未出貨數量")
@@ -276,7 +282,10 @@ def _count_statuses(rows: list[dict]) -> dict:
 
 # ------------------------------------------------------------------ 輸出
 
-_QUANTITY_COLUMNS = ["客戶", "料號", "效期", "未出貨數量", "銷貨數量", "差異(未出貨-銷貨)", "狀態"]
+_QUANTITY_COLUMNS = ["客戶", "料號", "效期", "批號", "未出貨數量", "銷貨數量",
+                     "差異(未出貨-銷貨)", "狀態"]
+# 批號寫成文字格式，避免 Excel 把 20270501 當數字（顯示 20,270,501）或轉成日期。
+_TEXT_COLUMNS = ("批號",)
 _ORDER_COLUMNS = [
     "標準化訂單編號", "未出貨原始編號", "銷貨單原始編號", "未出貨客戶", "銷貨單客戶",
     "未出貨筆數", "銷貨單筆數", "未出貨數量", "銷貨數量", "差異(未出貨-銷貨)", "狀態",
@@ -336,7 +345,9 @@ def _write_output(name1: str, name2: str, quantity_rows: list, order_rows: list)
             for col, header in enumerate(columns, start=1):
                 cell = ws.cell(row_offset, col, record[header])
                 cell.border = border
-                if col >= first_number_col and col != status_col:
+                if header in _TEXT_COLUMNS:
+                    cell.number_format = "@"
+                elif col >= first_number_col and col != status_col:
                     cell.number_format = "#,##0"
                 if col == status_col:
                     color = STATUS_COLORS.get(str(record[header]))
@@ -354,8 +365,12 @@ def _write_output(name1: str, name2: str, quantity_rows: list, order_rows: list)
             )
             ws.column_dimensions[letter].width = max(10, min(width + 2, 44))
 
-    write_table("數量核對", _QUANTITY_COLUMNS, quantity_rows, status_col=7, first_number_col=4)
-    write_table("訂單編號核對", _ORDER_COLUMNS, order_rows, status_col=11, first_number_col=6)
+    write_table("數量核對", _QUANTITY_COLUMNS, quantity_rows,
+                status_col=_QUANTITY_COLUMNS.index("狀態") + 1,
+                first_number_col=_QUANTITY_COLUMNS.index("未出貨數量") + 1)
+    write_table("訂單編號核對", _ORDER_COLUMNS, order_rows,
+                status_col=_ORDER_COLUMNS.index("狀態") + 1,
+                first_number_col=_ORDER_COLUMNS.index("未出貨筆數") + 1)
 
     buffer = io.BytesIO()
     wb.save(buffer)

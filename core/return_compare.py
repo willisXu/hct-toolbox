@@ -15,6 +15,8 @@
   - 倉別取代碼本身（RA 側常是「G10_新竹…」這種帶底線的地點字串，取底線
     前段），兩邊都轉大寫後比對；效期空白時仍以空字串成組，代表「這列不
     在乎效期」，不會被丟掉。
+  - 輸出除了「效期」（yyyy-mm-dd）另留一欄「批號」（yyyymmdd 原始寫法，
+    文字格式），方便直接拿去 NetSuite／倉儲系統查該批貨。
 """
 from __future__ import annotations
 
@@ -151,21 +153,24 @@ def _normalize_location(value: object) -> str:
     return text.strip()
 
 
-def _normalize_expiry(value: object) -> tuple[str, str]:
-    """回傳 (比對用 key, 顯示用文字)。
+def _normalize_expiry(value: object) -> tuple[str, str, str]:
+    """回傳 (比對用 key, 效期顯示, 批號顯示)。
 
     無法辨識為日期時，key 保留原始文字（casefold，加 raw: 前綴與日期 key
     區隔）：兩邊文字相同仍可對上，但不同批號不會被誤併成同一筆；
     只有真正空白的效期才用空字串 key。
+
+    批號顯示＝可解析日期時的 yyyymmdd（倉儲/NetSuite 的批號寫法），無法解析
+    時照抄原文；輸出時寫成文字格式，Excel 才不會把 20270501 轉成數字或日期。
     """
     text = normalize_text(value)
     if not text:
-        return "", ""
+        return "", "", ""
     parsed = try_parse_date(value)
     if parsed:
         display = parsed.strftime("%Y-%m-%d")
-        return display, display
-    return f"raw:{text.casefold()}", text
+        return display, display, parsed.strftime("%Y%m%d")
+    return f"raw:{text.casefold()}", text, text
 
 
 # ------------------------------------------------------------------ 核對
@@ -174,37 +179,41 @@ def _normalize_expiry(value: object) -> tuple[str, str]:
 def _build_compare(ra_rows, ra_headers, hct_rows, hct_headers) -> list[dict]:
     records: dict[tuple, dict] = {}
 
-    def get_record(material: str, expiry_key: str, expiry_display: str, name: str,
-                   location: str) -> dict:
+    def get_record(material: str, expiry_key: str, expiry_display: str, batch: str,
+                   name: str, location: str) -> dict:
         key = (material.casefold(), expiry_key, location)
         record = records.setdefault(key, {
-            "料號": material, "品名": name, "效期": expiry_display, "倉別": location,
-            "退貨授權數量": 0.0, "入庫數量": 0.0,
+            "料號": material, "品名": name, "效期": expiry_display, "批號": batch,
+            "倉別": location, "退貨授權數量": 0.0, "入庫數量": 0.0,
         })
         if not record["品名"] and name:
             record["品名"] = name
+        if not record["批號"] and batch:
+            record["批號"] = batch
         return record
 
     for row_index in range(1, len(ra_rows)):
         material = _strip_dr_prefix(normalize_text(_cell(ra_rows, row_index, ra_headers, "DR_料號")))
         if not material:
             continue  # 運費等非品項明細列，DR_料號空白
-        expiry_key, expiry_display = _normalize_expiry(_cell(ra_rows, row_index, ra_headers, "交易序號/批號"))
+        expiry_key, expiry_display, batch = _normalize_expiry(
+            _cell(ra_rows, row_index, ra_headers, "交易序號/批號"))
         quantity = normalize_number(_cell(ra_rows, row_index, ra_headers, "交易序號/批號數量"))
         name = normalize_text(_cell(ra_rows, row_index, ra_headers, "顯示名稱"))
         location = _normalize_location(_cell(ra_rows, row_index, ra_headers, "倉別"))
-        record = get_record(material, expiry_key, expiry_display, name, location)
+        record = get_record(material, expiry_key, expiry_display, batch, name, location)
         record["退貨授權數量"] += quantity
 
     for row_index in range(1, len(hct_rows)):
         material = _strip_dr_prefix(normalize_text(_cell(hct_rows, row_index, hct_headers, "產品編號")))
         if not material:
             continue
-        expiry_key, expiry_display = _normalize_expiry(_cell(hct_rows, row_index, hct_headers, "效期"))
+        expiry_key, expiry_display, batch = _normalize_expiry(
+            _cell(hct_rows, row_index, hct_headers, "效期"))
         quantity = normalize_number(_cell(hct_rows, row_index, hct_headers, "數量"))
         name = normalize_text(_cell(hct_rows, row_index, hct_headers, "產品名稱"))
         location = _normalize_location(_cell(hct_rows, row_index, hct_headers, "儲區類別"))
-        record = get_record(material, expiry_key, expiry_display, name, location)
+        record = get_record(material, expiry_key, expiry_display, batch, name, location)
         record["入庫數量"] += quantity
 
     result = []
@@ -233,8 +242,10 @@ def _count_statuses(rows: list[dict]) -> dict:
 
 # ------------------------------------------------------------------ 輸出
 
-_DETAIL_COLUMNS = ["料號", "品名", "效期", "倉別", "退貨授權數量", "入庫數量",
+_DETAIL_COLUMNS = ["料號", "品名", "效期", "批號", "倉別", "退貨授權數量", "入庫數量",
                    "差異(授權-入庫)", "狀態"]
+# 批號寫成文字格式，避免 Excel 把 20270501 當數字（顯示 20,270,501）或轉成日期。
+_TEXT_COLUMNS = ("批號",)
 
 
 def _write_output(name1: str, name2: str, detail_rows: list) -> bytes:
@@ -283,7 +294,9 @@ def _write_output(name1: str, name2: str, detail_rows: list) -> bytes:
         for col, header in enumerate(_DETAIL_COLUMNS, start=1):
             cell = ws.cell(row_offset, col, record[header])
             cell.border = border
-            if col >= first_number_col and col != status_col:
+            if header in _TEXT_COLUMNS:
+                cell.number_format = "@"
+            elif col >= first_number_col and col != status_col:
                 cell.number_format = "#,##0"
             if col == status_col:
                 color = STATUS_COLORS.get(str(record[header]))

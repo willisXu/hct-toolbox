@@ -17,6 +17,8 @@
     範圍，每一筆非 M00 倉都會變成假的「僅 NetSuite 存在」。
   - 代工廠報表只有一個「庫存數量」欄，同時當作可用量與總庫存量(同 293 格式)。
   - 以「倉別+料號+到期日」做日期明細核對，另以「倉別+料號」做料號彙總核對。
+  - 日期明細除了「到期日」(日期格式)另留一欄「批號」(yyyymmdd 文字格式)，
+    對應各報表批號欄的原始寫法，方便直接拿去 NetSuite／倉儲系統查該批貨。
   - 差異基準：HCT／代工廠／M00－NetSuite。
 """
 from __future__ import annotations
@@ -177,6 +179,11 @@ def _expiry_output(expiry_key: str) -> object:
     if not expiry_key:
         return "無到期日"
     return date(int(expiry_key[:4]), int(expiry_key[4:6]), int(expiry_key[6:]))
+
+
+def _batch_output(expiry_key: str) -> str:
+    """批號欄：核對鍵本身就是 yyyymmdd，直接當批號文字輸出（無到期日照舊標示）。"""
+    return expiry_key or "無到期日"
 
 
 # ------------------------------------------------------------------ 匯入
@@ -455,6 +462,7 @@ def _build_reconciliation(hct_data: dict, ns_data: dict, include_expiry: bool,
         }
         if include_expiry:
             record["到期日"] = _expiry_output(key[2])
+            record["批號"] = _batch_output(key[2])
         result.append(record)
     return result
 
@@ -564,15 +572,17 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
 
 def _detail_columns(ext_label: str) -> list[str]:
     return [
-        "倉別", "料號", "品名／項目", "到期日", f"{ext_label} 可出數量", "NetSuite 項目計數",
-        "可用量差額", f"{ext_label} 庫存數量", "NetSuite 數量", "總庫存差額", "狀態", "結果說明",
-        f"{ext_label} 來源列數", "NetSuite 來源列數",
+        "倉別", "料號", "品名／項目", "到期日", "批號", f"{ext_label} 可出數量",
+        "NetSuite 項目計數", "可用量差額", f"{ext_label} 庫存數量", "NetSuite 數量",
+        "總庫存差額", "狀態", "結果說明", f"{ext_label} 來源列數", "NetSuite 來源列數",
     ]
 
 
 def _item_columns(ext_label: str) -> list[str]:
+    """料號彙總不含到期日，連帶也不會有批號欄（同一料號可能橫跨多個批號）。"""
     columns = _detail_columns(ext_label)
     columns.remove("到期日")
+    columns.remove("批號")
     return columns
 
 
@@ -674,7 +684,8 @@ def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats,
                 cell = ws.cell(row_offset, col, value)
                 if header == "到期日" and isinstance(value, date):
                     cell.number_format = "yyyy-mm-dd"
-                elif header == "料號":
+                elif header in ("料號", "批號"):
+                    # 批號寫成文字，避免 Excel 把 20270501 當數字或轉成日期。
                     cell.number_format = "@"
                 elif isinstance(value, (int, float)) and header not in ("原始列號",):
                     cell.number_format = "#,##0.####"
@@ -689,14 +700,18 @@ def _write_output(detail_rows, item_rows, anomalies, hct_stats, ns_stats,
         last_col = openpyxl.utils.get_column_letter(len(columns))
         ws.auto_filter.ref = f"A1:{last_col}{max(len(rows) + 1, 1)}"
         ws.freeze_panes = "A2"
-        widths = {"倉別": 10, "料號": 18, "品名／項目": 34, "到期日": 14,
+        widths = {"倉別": 10, "料號": 18, "品名／項目": 34, "到期日": 14, "批號": 12,
                   "狀態": 18, "結果說明": 42, "異常說明": 32, "原始值": 32, "來源檔名": 28}
         for col, header in enumerate(columns, start=1):
             letter = openpyxl.utils.get_column_letter(col)
             ws.column_dimensions[letter].width = widths.get(header, 16)
 
-    write_table("日期明細", _detail_columns(ext_label), detail_rows, status_col=11)
-    write_table("料號彙總", _item_columns(ext_label), item_rows, status_col=10)
+    detail_columns = _detail_columns(ext_label)
+    item_columns = _item_columns(ext_label)
+    write_table("日期明細", detail_columns, detail_rows,
+                status_col=detail_columns.index("狀態") + 1)
+    write_table("料號彙總", item_columns, item_rows,
+                status_col=item_columns.index("狀態") + 1)
     write_table("資料異常", _ANOMALY_COLUMNS, anomalies, status_col=None)
 
     buffer = io.BytesIO()
