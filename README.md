@@ -30,6 +30,10 @@
 
 只有 **299 開頭**（架上組虛擬組合）需要拆解。299 開頭但不在對照表裡的，會原樣保留不拆解，
 並列在輸出檔的「未對應組合料號」工作表與介面警告區，提醒把它補進對照表。
+
+對照表缺料號時，除了等 ERP 匯出的 `bundles.csv`，也可以用
+`tools/derive_bundle_map.py` 從 **NS 品項主檔的「規格」欄**推導補上——該欄本身
+就是組合公式（`HHS030A*4+HHS015A`）。詳見 `handoff.md`。
 298 開頭是正常組合品（ERP 有自己的品號與庫存），不拆解也不會被當成漏對照。
 
 ## 出貨格式的虛擬倉（HCT 銷貨報表 AD 欄）
@@ -136,6 +140,7 @@ core/
   export_log.py     # 已轉出紀錄的資料結構與合併邏輯（單號 → 轉出次數/時間/格式）
   export_store.py   # 紀錄存放後端：本機 JSON 檔 / Google 試算表
   gsheet.py         # Google Sheets API v4（服務帳戶）讀寫
+tools/              # 維護用腳本(derive_bundle_map.py:從品項主檔規格公式補組合對照表)
 netsuite_restlet/   # 需部署到 NetSuite 的 SuiteScript RESTlet + 部署說明
 data/               # 本機紀錄／待補紀錄 JSON（自動產生、不進版控）
 mappings/           # 輸出範本（HCT範本.xlsx、M00出貨格式.xlsx）、組合對照表、saved search 對照表
