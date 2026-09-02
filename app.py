@@ -765,7 +765,20 @@ with tab_netsuite:
                         st.text(f"• {warning}")
 
     # ---------------------------------------------------------- 欄名對照表
-    alias_cache = xlio_mod.load_header_alias_cache(refresh=True)
+    # 這段用到 core/xlio.py、core/netsuite.py 在 2026-09 才加的函式。Streamlit
+    # 的「重跑」只重新執行 app.py，已經 import 過的模組留在 sys.modules 裡不會
+    # 更新；雲端剛部署完若沒有完整重啟，就會變成「新的 app.py + 舊的 core 模組」，
+    # 在這裡炸出 AttributeError（訊息還會被 Streamlit 遮蔽成一句看不懂的話）。
+    # 整頁掛掉不如講清楚要按哪裡。
+    try:
+        alias_cache = xlio_mod.load_header_alias_cache(refresh=True)
+    except AttributeError:
+        st.error(
+            "執行中的 core 模組是舊版（缺少欄名對照快取的函式），「🔤 欄名對照表」"
+            "暫時無法使用——其他功能不受影響。請到右下角 **Manage app → Reboot app** "
+            "完整重啟一次（Streamlit 的 Rerun 不會重新載入已經 import 的模組）。"
+        )
+        alias_cache = {}
     learned = alias_cache.get("aliases") or {}
     cache_title = (
         f"🔤 欄名對照表（已學 {len(learned)} 組，更新於 {alias_cache.get('updated_at')}）"
