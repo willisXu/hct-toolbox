@@ -2,6 +2,11 @@
 
 供「HCT 工具箱」網頁直接用 saved search ID 抓資料，不必手動匯出 .xls。
 
+> **2026-09 更新**：`columns` 改回傳每欄的 `{name, label, join}`（原本只回一個字串），
+> 並支援 `&columnsOnly=1` 只取欄位定義、不執行查詢——「🔤 欄名對照表」靠這個自動推導
+> 中英文欄名對照。**請重新上傳一次 `saved_search_restlet.js` 覆蓋舊版**；沒更新的話
+> 抓取仍可正常運作（呼叫端相容舊格式），只是學不到對照表。
+
 ## 部署步驟（在 NetSuite 後台，需 SuiteScript 開發/部署權限）
 
 1. Setup → File Cabinet，上傳 `saved_search_restlet.js` 到任一資料夾（例如 SuiteScripts）。

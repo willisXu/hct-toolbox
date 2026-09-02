@@ -27,6 +27,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .xlio import (
+    apply_netsuite_header_aliases,
     build_header_map,
     first_sheet,
     is_blank_row,
@@ -219,6 +220,132 @@ def convert_rows(
     )
 
 
+# ------------------------------------------------------------------ 欄位對照預檢
+
+# 轉換實際會讀到的來源欄位一覽（app 的「欄位對照檢查」表格用）。
+#
+# 必要欄缺少會直接擋下來，看得到；真正會出事的是「選用欄」——欄名對不上時
+# 不擋、不報錯，默默輸出空白批號/效期/備註（2026-09 就是這樣：saved search
+# 的批號與主要備忘錄欄沒設中文 Label，匯出成 Transaction Serial/Lot Number
+# 與 Memo (Main)，轉換「成功」但效期整欄空白）。所以轉換前先把對照結果攤開來。
+#
+# 每筆 = (欄名, 適用模式, 用途, 缺少的後果)
+_HEADER_USAGE = (
+    ("內部 ID", (MODE_ORDER, MODE_TRANSFER), "文件編號空白時的備援單號", "單號會空白"),
+    ("文件編號", (MODE_ORDER, MODE_TRANSFER), "配送編號／訂單編號", "改用「ID-內部 ID」當單號"),
+    ("日期", (MODE_ORDER, MODE_TRANSFER), "單據日期", "無法轉換"),
+    ("銷售訂單類型", (MODE_ORDER,), "判斷可否跨單合併（收件條件合併時）", "無法判斷合併"),
+    ("銷售訂單單號", (MODE_ORDER, MODE_TRANSFER), "輸出的訂單編號", "改用文件編號"),
+    ("項目", (MODE_ORDER, MODE_TRANSFER), "料號／品名的備援來源", "料號與品名可能空白"),
+    ("項目名稱", (MODE_ORDER, MODE_TRANSFER), "商品名稱（別名：顯示名稱）", "商品名稱整欄空白"),
+    ("DR_料號", (MODE_ORDER, MODE_TRANSFER), "出貨商品編號", "改用「項目」欄拆出的料號"),
+    ("序號/批號", (MODE_ORDER, MODE_TRANSFER), "批號與效期（別名：交易序號/批號）", "批號、效期整欄空白"),
+    ("出貨數量", (MODE_ORDER, MODE_TRANSFER), "出貨數量", "無法轉換"),
+    ("出貨客戶", (MODE_ORDER, MODE_TRANSFER), "收件客戶（調撥單別名：目標地點）", "無法轉換"),
+    ("門市/倉儲", (MODE_ORDER, MODE_TRANSFER), "出貨通路門店名稱（調撥單別名：倉儲）", "無法轉換"),
+    ("門市/倉儲聯繫人", (MODE_ORDER, MODE_TRANSFER), "提貨人姓名", "無法轉換"),
+    ("門市/倉儲電話", (MODE_ORDER, MODE_TRANSFER), "提貨人電話", "無法轉換"),
+    ("門市/倉儲地址", (MODE_ORDER, MODE_TRANSFER), "提貨人地址與郵遞區號", "無法轉換"),
+    ("DR_預計到貨日期", (MODE_ORDER, MODE_TRANSFER), "指定送達日", "指定送達日空白"),
+    ("DR_預計到貨時段", (MODE_ORDER, MODE_TRANSFER), "指定送達時間", "指定送達時間空白"),
+    ("DR_溫馨提醒", (MODE_ORDER, MODE_TRANSFER), "備註（來源：備忘錄／備忘錄 (主要)）", "備註整欄空白"),
+    ("客戶採購單編號", (MODE_ORDER, MODE_TRANSFER), "以客戶採購單編號合併送貨單", "無法以採購單合併，全部各自成單"),
+    ("DR_程式執行狀態", (MODE_ORDER, MODE_TRANSFER), "標記無法轉換的明細", "不會標記問題明細"),
+)
+
+_WAREHOUSE_USAGE_LABEL = "虛擬倉來源"
+
+# 兩種模式的必要欄位聯集（netsuite.py 判斷「內部 ID 補救」值不值得介入）。
+ALL_REQUIRED_HEADERS = tuple(dict.fromkeys(
+    name for names in _REQUIRED_HEADERS.values() for name in names
+))
+
+# 這套工具「看得懂」的來源欄名全集：標準欄名 + 所有別名 + 備忘錄/倉別候選欄。
+# 從 NetSuite 自動學欄名對照時用來挑正解——同一個欄位內部 ID 在不同 saved
+# search 有好幾個中文 Label 時，優先採用工具本來就認得的那個。
+KNOWN_SOURCE_HEADERS = frozenset(
+    name.casefold()
+    for group in (
+        ALL_REQUIRED_HEADERS,
+        tuple(name for entry in _HEADER_USAGE for name in (entry[0],)),
+        tuple(
+            name
+            for mode_aliases in _ALIASES.values()
+            for canonical, aliases in mode_aliases.items()
+            for name in (canonical,) + tuple(aliases)
+        ),
+        tuple(name for names in _MEMO_ALIASES.values() for name in names),
+        _WAREHOUSE_ALIASES,
+        _ARRIVAL_ALIASES,
+        _ARRIVAL_SLOT_ALIASES,
+        ("DR_溫馨提醒", "DR_程式執行狀態", "客戶採購單編號", "銷售訂單單號"),
+    )
+    for name in group
+)
+
+
+def describe_header_mapping(
+    header_row: list, mode: str,
+    memo_source: str = MEMO_SOURCE_LINE,
+    merge_by: str = MERGE_BY_RECIPIENT,
+) -> list[dict]:
+    """轉換前的欄位對照結果：每個轉換會讀的欄位對到來源檔哪一欄、缺少會怎樣。
+
+    比對邏輯完全走 convert_rows 的同一條路（英文預設欄名 → 中文欄名 → 模式別名
+    → 備忘錄來源 → 到貨日關鍵字備援），所以這張表看到的就是轉換當下的實際結果，
+    不是另一套猜測。
+    """
+    headers = build_header_map(header_row)
+    _apply_aliases(headers, mode, memo_source)
+
+    # 欄索引 → 來源檔原本的欄名（同名欄取第一個，跟 build_header_map 一致）
+    labels: dict[int, str] = {}
+    for index, value in enumerate(header_row):
+        text = normalize_text(value)
+        if text and index not in labels:
+            labels[index] = text
+
+    required = {h.casefold() for h in _REQUIRED_HEADERS[mode]}
+    rows: list[dict] = []
+    for canonical, modes, usage, impact in _HEADER_USAGE:
+        if mode not in modes:
+            continue
+        key = canonical.casefold()
+        is_required = key in required
+        if key == "客戶採購單編號".casefold() and merge_by == MERGE_BY_PURCHASE_ORDER:
+            usage += "（目前選的合併方式）"
+        index = headers.get(key)
+        if index is not None:
+            source = labels.get(index, "")
+            status = "✅ 對應" if source == canonical else "✅ 已自動對應"
+            rows.append({
+                "欄位": canonical, "用途": usage, "來源欄位": source, "狀態": status,
+            })
+            continue
+        rows.append({
+            "欄位": canonical,
+            "用途": usage,
+            "來源欄位": "—",
+            "狀態": ("❌ 必要欄位缺少，無法轉換" if is_required else f"⚠️ 缺少 — {impact}"),
+        })
+
+    warehouse_sources = [name for name in _WAREHOUSE_ALIASES if name.casefold() in headers]
+    rows.append({
+        "欄位": _WAREHOUSE_USAGE_LABEL,
+        "用途": "虛擬倉（可用欄名：" + "、".join(_WAREHOUSE_ALIASES) + "）",
+        "來源欄位": "、".join(warehouse_sources) if warehouse_sources else "—",
+        "狀態": "✅ 對應" if warehouse_sources else "⚠️ 缺少 — 虛擬倉一律用範本預設值 G10",
+    })
+    return rows
+
+
+def header_mapping_counts(rows: list[dict]) -> tuple[int, int]:
+    """(必要欄缺少數, 選用欄缺少數)，給 app 決定要不要把預檢面板預設展開。"""
+    missing_required = sum(1 for r in rows if r["狀態"].startswith("❌"))
+    missing_optional = sum(1 for r in rows if r["狀態"].startswith("⚠️"))
+    return missing_required, missing_optional
+
+
 # ------------------------------------------------------------------ 讀表輔助
 
 
@@ -226,6 +353,12 @@ def _apply_aliases(
     headers: dict[str, int], mode: str, memo_source: str = MEMO_SOURCE_LINE,
 ) -> list[str]:
     """套用別名對照；回傳別名/關鍵字比對備援產生的提醒訊息（給呼叫端併入警告）。"""
+    # 先把英文預設欄名譯成中文欄名，後面的模式別名（顯示名稱→項目名稱、
+    # 交易序號/批號→序號/批號…）才接得上。saved search 沒設中文 Label 的欄
+    # 匯出時就是英文，同一份報表常常中英混雜（文件編號是中文、Memo (Main)
+    # 是英文）；漏譯的下場有兩種：必要欄直接擋下（文件編號/日期/項目），
+    # 非必要欄（序號/批號、備忘錄）則是不擋、默默輸出空白效期與空白溫馨提醒。
+    apply_netsuite_header_aliases(headers)
     for canonical, aliases in _ALIASES[mode].items():
         key = canonical.casefold()
         if key in headers:

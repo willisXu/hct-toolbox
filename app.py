@@ -34,6 +34,8 @@ from core import netsuite as netsuite_mod
 from core import return_compare as return_compare_mod
 from core import shipping
 from core import table_filter
+from core import xlio as xlio_mod
+from core.xlio import first_sheet, read_workbook
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "mappings" / "HCT範本.xlsx"
@@ -120,6 +122,42 @@ def _show_error(exc: Exception) -> None:
 
 # ------------------------------------------------------------ 訂單 / 調撥單
 
+@st.cache_data(show_spinner=False)
+def _uploaded_header_row(data: bytes, filename: str) -> list:
+    """只取來源檔的欄名列（轉換前的欄位對照預檢用）。每次重跑都重讀檔案太慢，快取。"""
+    return first_sheet(read_workbook(data, filename))[0]
+
+
+def _header_check_panel(header_row: list, mode: str, memo_source: str, merge_by: str) -> None:
+    """轉換前先把欄位對照結果攤開來。
+
+    必要欄缺少會直接報錯，看得到；真正會出事的是選用欄對不上——不擋、不報錯，
+    默默輸出空白批號/效期/備註。所以有缺就預設展開，沒缺才收起來。
+    """
+    try:
+        rows = shipping.describe_header_mapping(header_row, mode, memo_source, merge_by)
+    except Exception:  # noqa: BLE001 - 預檢只是輔助，不能擋住轉換
+        return
+    missing_required, missing_optional = shipping.header_mapping_counts(rows)
+    auto = sum(1 for row in rows if row["狀態"] == "✅ 已自動對應")
+    if missing_required:
+        summary = f"❌ 欄位對照檢查：{missing_required} 個必要欄位對不上，轉換會失敗"
+    elif missing_optional:
+        summary = f"⚠️ 欄位對照檢查：{missing_optional} 個選用欄位缺少（相關欄位會空白）"
+    else:
+        summary = "✅ 欄位對照檢查：全部對得上"
+    if auto:
+        summary += f"；其中 {auto} 個欄位是自動對應（英文欄名／別名）"
+    with st.expander(summary, expanded=bool(missing_required or missing_optional)):
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "「已自動對應」＝來源欄名跟工具的標準欄名不同，靠英中對照／別名接上的"
+            "（例如 Memo (Main) → 備忘錄 (主要)）。對不上的欄位可以到"
+            "「🔗 NetSuite 直接抓取 → 🔤 欄名對照表」按更新，從 NetSuite 自動學。"
+        )
+
+
+
 
 def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> None:
     st.subheader(title)
@@ -146,6 +184,14 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
     memo_source = _memo_source_radio(f"{key_prefix}_memo_source")
     merge_by = _merge_by_radio(f"{key_prefix}_merge_by")
     state_key = f"{key_prefix}_result"
+
+    if uploaded is not None:
+        try:
+            header_row = _uploaded_header_row(uploaded.getvalue(), uploaded.name)
+        except Exception as exc:  # noqa: BLE001 - 讀不到欄名列就交給轉換時報錯
+            st.warning(f"讀取欄名列失敗，無法先做欄位對照檢查：{exc}")
+        else:
+            _header_check_panel(header_row, mode, memo_source, merge_by)
 
     if uploaded is not None and st.button("🚀 開始轉換", key=f"{key_prefix}_run", type="primary"):
         try:
@@ -642,6 +688,8 @@ with tab_netsuite:
                 ns_memo_source = _memo_source_radio("ns_memo_source")
                 ns_merge_by = _merge_by_radio("ns_merge_by")
 
+                _header_check_panel(ns_rows[0], ns_mode, ns_memo_source, ns_merge_by)
+
                 if st.button("🚀 開始轉換", key="ns_run", type="primary"):
                     if not visible_selected:
                         st.warning("目前篩選結果裡沒有勾選任何資料列。")
@@ -715,6 +763,57 @@ with tab_netsuite:
                 with st.expander(f"⚠️ 警告訊息（{len(result.warnings)} 則）"):
                     for warning in result.warnings:
                         st.text(f"• {warning}")
+
+    # ---------------------------------------------------------- 欄名對照表
+    alias_cache = xlio_mod.load_header_alias_cache(refresh=True)
+    learned = alias_cache.get("aliases") or {}
+    cache_title = (
+        f"🔤 欄名對照表（已學 {len(learned)} 組，更新於 {alias_cache.get('updated_at')}）"
+        if learned else "🔤 欄名對照表（尚未從 NetSuite 學過）"
+    )
+    with st.expander(cache_title, expanded=False):
+        st.markdown(
+            "saved search 的欄位沒設中文 Label 時，匯出／抓取拿到的是 NetSuite 的英文預設名稱"
+            "（`Document Number`、`Memo (Main)`…），跟轉換認的中文欄名對不上——必要欄會直接"
+            "報錯，選用欄則是**不報錯、默默輸出空白批號與備註**。"
+            "\n\n"
+            "按下面的按鈕會讀取每一支 saved search 的欄位定義（只讀欄位、不跑查詢），"
+            "用「同一個欄位內部 ID 在別支 saved search 有中文 Label」自動推出對照表，"
+            "存起來給**上傳檔案**與**直接抓取**兩條路徑共用。saved search 欄位改名後重按一次即可。"
+        )
+        if st.button("🔄 從 NetSuite 更新欄名對照表", key="ns_learn_aliases"):
+            try:
+                client, restlet_url = _netsuite_client()
+                with st.spinner("讀取各 saved search 的欄位定義中..."):
+                    aliases, alias_rows, notes = netsuite_mod.refresh_header_aliases(
+                        client, restlet_url, searches
+                    )
+            except Exception as exc:  # noqa: BLE001
+                _show_error(exc)
+            else:
+                st.session_state["ns_alias_result"] = (aliases, alias_rows, notes)
+                st.rerun()
+        alias_result = st.session_state.get("ns_alias_result")
+        if alias_result:
+            aliases, alias_rows, notes = alias_result
+            if aliases:
+                st.success(f"學到 {len(aliases)} 組欄名對照，已存進 mappings/欄位對照快取.json。")
+                st.dataframe(pd.DataFrame(alias_rows), use_container_width=True, hide_index=True)
+            else:
+                st.warning("這次沒有學到任何對照（見下方訊息）。")
+            for note in notes:
+                st.text(f"• {note}")
+            st.caption(
+                "公式欄（NetSuite 內部 ID 都是 formulatext/formuladate）不同欄會撞在一起，"
+                "刻意不學；那些欄位請直接在 saved search 設中文 Label。"
+            )
+        elif learned:
+            st.dataframe(
+                pd.DataFrame(
+                    [{"來源欄名": k, "對應中文欄名": v} for k, v in sorted(learned.items())]
+                ),
+                use_container_width=True, hide_index=True,
+            )
 
     # ---------------------------------------------------------- 轉出紀錄管理
     with st.expander("🗂️ 轉出紀錄管理", expanded=bool(ns_pending_records)):

@@ -1,0 +1,35 @@
+{
+  "updated_at": "2026-09-02 12:27:23",
+  "aliases": {
+    "custbody_dr_soeta": "DR_預計到貨日期",
+    "custbody_dr_soetatp": "DR_預計到貨時段",
+    "custbody_dr_sotype": "銷售訂單類型",
+    "custbody_dr_systemstatus": "DR_程式執行狀態",
+    "custbody_pce_chooselotfunction": "批號選擇方法",
+    "custitem_dr_itemname1": "DR_料號",
+    "date": "日期",
+    "display name": "項目名稱",
+    "displayname": "項目名稱",
+    "document number": "文件編號",
+    "internal id": "內部 ID",
+    "internalid": "內部 ID",
+    "inventorylocation": "庫存地點",
+    "item": "項目",
+    "location": "來源地點",
+    "memo": "備忘錄",
+    "serialnumber": "交易序號/批號",
+    "trandate": "日期",
+    "tranid": "文件編號",
+    "transaction serial/lot number": "交易序號/批號"
+  },
+  "sources": [
+    {
+      "label": "銷售訂單未出貨明細",
+      "columns": 22
+    },
+    {
+      "label": "調撥單未出貨明細",
+      "columns": 24
+    }
+  ]
+}

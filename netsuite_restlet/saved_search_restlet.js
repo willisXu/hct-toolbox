@@ -9,7 +9,8 @@
  * 只會看到籠統的 UNEXPECTED_ERROR）。
  *
  * 呼叫方式：GET .../restlet.nl?script=<此腳本ID>&deploy=1&searchId=customsearchXXX&page=0
- * 回應：{ columns, rows（此頁資料列，不含標題）, page, pageCount }
+ *           加上 &columnsOnly=1 則只回欄位定義、不執行查詢（建立欄名對照表用）
+ * 回應：{ columns（每欄 {name, label, join}）, rows（此頁資料列，不含標題）, page, pageCount }
  * 呼叫端見 rows 為空或 page+1 >= pageCount 時停止翻頁。
  */
 define(['N/search'], function (search) {
@@ -28,9 +29,29 @@ define(['N/search'], function (search) {
 
         try {
             var loadedSearch = search.load({ id: searchId });
+            // 回傳完整欄位定義而不是壓成一個字串：label 會隨語言與自訂標籤變動
+            // （沒設中文 Label 的欄拿到的是英文預設名稱 Document Number / Date /
+            // Memo (Main)…），name 是欄位內部 ID（tranid / trandate / memomain…），
+            // 跟語言無關。呼叫端優先用 label、label 空白才退到 name，並在 label
+            // 認不得、內部 ID 卻對得上必要欄位時用內部 ID 補救。
+            // 舊版只回字串陣列，呼叫端仍相容（見 core/netsuite.py _normalize_headers）。
             var columns = loadedSearch.columns.map(function (col) {
-                return col.label || col.name;
+                return {
+                    name: col.name || null,
+                    label: col.label || null,
+                    join: col.join || null
+                };
             });
+
+            // columnsOnly=1：只要欄位定義、不跑查詢。用來建立「英文欄名 → 中文欄名」
+            // 對照表（同一個欄位內部 ID 在別支 saved search 有中文 Label 時就能自動
+            // 對上），幾乎不耗 governance，可以一次掃過所有 saved search。
+            var columnsOnly = context.columnsOnly;
+            if (columnsOnly === '1' || columnsOnly === 'true' || columnsOnly === true) {
+                return JSON.stringify({
+                    columns: columns, rows: [], page: 0, pageCount: 0, columnsOnly: true
+                });
+            }
 
             var pagedData = loadedSearch.runPaged({ pageSize: PAGE_SIZE });
             var pageCount = pagedData.pageRanges.length;

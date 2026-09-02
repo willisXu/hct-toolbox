@@ -8,9 +8,11 @@ NetSuite 匯出的 .xls 其實是 SpreadsheetML XML；HCT 系統匯出的 .xls �
 from __future__ import annotations
 
 import io
+import json
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, date
+from pathlib import Path
 
 
 SSNS = "{urn:schemas-microsoft-com:office:spreadsheet}"
@@ -164,6 +166,111 @@ def build_header_map(header_row: list) -> dict[str, int]:
         if text and text.casefold() not in headers:
             headers[text.casefold()] = index
     return headers
+
+
+# NetSuite saved search 的欄位沒設中文自訂 Label 時，匯出檔／RESTlet 拿到的是
+# 該欄位的英文預設名稱（Document Number、Memo (Main)…），跟轉換邏輯認的中文
+# 欄名對不上。同一份報表常常一半中文一半英文——有設 Label 的欄（來源倉別、
+# 出貨數量…）是中文，沒設的就退回英文，所以不能只靠「整份是中文還是英文」判斷。
+#
+# 對照表左邊同時收兩種寫法：
+#   1. 英文預設名稱（手動匯出檔、RESTlet 的 col.label 都是這個）
+#   2. 欄位內部 ID（連 Label 都沒有時 RESTlet 取 col.name 回傳 displayname 之類）
+NETSUITE_HEADER_ALIASES = {
+    # 英文預設名稱
+    "document number": "文件編號",
+    "date": "日期",
+    "internal id": "內部 ID",
+    "item": "項目",
+    "display name": "顯示名稱",
+    "description": "說明",
+    "memo": "備忘錄",
+    "memo (main)": "備忘錄 (主要)",
+    "transaction serial/lot number": "交易序號/批號",
+    "serial/lot number": "交易序號/批號",
+    "transaction line type": "交易明細行類型",
+    "quantity": "數量",
+    "location": "地點",
+    # 欄位內部 ID（saved search 沒設 Label 時回傳的值）
+    "tranid": "文件編號",
+    "trandate": "日期",
+    "internalid": "內部 ID",
+    "itemid": "項目",
+    "displayname": "顯示名稱",
+    "salesdescription": "說明",
+    "memomain": "備忘錄 (主要)",
+}
+
+
+# 從 NetSuite 自動學回來的欄名對照（見 core/netsuite.py learn_header_aliases）。
+# 內建表是人工驗證過的少數常見欄名，這份則是掃過帳號裡的 saved search、用
+# 「同一個欄位內部 ID 在別支 saved search 有中文 Label」推出來的，涵蓋公司自己
+# 那些欄。存成檔案是為了讓「上傳檔案」路徑（根本沒連 NetSuite）也用得到。
+HEADER_ALIAS_CACHE_PATH = Path(__file__).resolve().parent.parent / "mappings" / "欄位對照快取.json"
+
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_learned_cache: dict | None = None
+
+
+def has_cjk(text: object) -> bool:
+    """含中日韓文字＝這是人設過的中文 Label，不是 NetSuite 的英文預設名稱。"""
+    return bool(_CJK_RE.search(str(text or "")))
+
+
+def load_header_alias_cache(refresh: bool = False) -> dict:
+    """讀自動對照快取；檔案不存在／壞掉都當成空的（這只是加分項，不能擋住轉換）。"""
+    global _learned_cache
+    if _learned_cache is not None and not refresh:
+        return _learned_cache
+    try:
+        data = json.loads(HEADER_ALIAS_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    aliases = data.get("aliases")
+    data["aliases"] = {
+        str(k).casefold(): str(v)
+        for k, v in (aliases or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    _learned_cache = data
+    return data
+
+
+def save_header_alias_cache(aliases: dict[str, str], sources: list[dict]) -> Path:
+    """把學到的對照寫成檔案，並讓後續呼叫立刻吃到新的內容。"""
+    global _learned_cache
+    payload = {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "aliases": {str(k).casefold(): str(v) for k, v in aliases.items()},
+        "sources": sources,
+    }
+    HEADER_ALIAS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    HEADER_ALIAS_CACHE_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _learned_cache = payload
+    return HEADER_ALIAS_CACHE_PATH
+
+
+def header_aliases() -> dict[str, str]:
+    """內建表 + 自動學回來的對照。衝突時以內建表為準（人工驗證過的優先）。"""
+    merged = dict(load_header_alias_cache().get("aliases") or {})
+    merged.update(NETSUITE_HEADER_ALIASES)
+    return merged
+
+
+def apply_netsuite_header_aliases(headers: dict[str, int]) -> None:
+    """把 header map 裡的英文預設欄名／欄位內部 ID 補上對應的中文欄名（就地修改）。
+
+    只補、不覆蓋：來源檔本來就有該中文欄時以中文欄為準（實際匯出檔會同時出現
+    「內部 ID」與「Internal ID」兩欄），英文鍵也保留，欄位檢視／篩選不受影響。
+    """
+    for alias, canonical in header_aliases().items():
+        index = headers.get(alias)
+        if index is not None:
+            headers.setdefault(canonical.casefold(), index)
 
 
 def is_blank_row(row: list) -> bool:

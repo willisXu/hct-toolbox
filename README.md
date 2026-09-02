@@ -110,6 +110,28 @@
 3. 需要抓別的 saved search 時，編輯 `mappings/netsuite_saved_searches.yaml` 增加項目。
 4. （選用）要讓轉出紀錄長期保存，依上一節設定 `[gsheet_log]` 存到 Google 試算表。
 
+## 中英文欄名自動對照
+
+saved search 的欄位若沒在 NetSuite 設中文 Label，匯出／抓取拿到的會是 NetSuite 的
+英文預設名稱（`Document Number`、`Date`、`Item`、`Memo (Main)`、
+`Transaction Serial/Lot Number`…），同一份報表常常中英混雜。工具兩條路徑都會自動
+把英文欄名對回中文欄名：
+
+* **內建對照表**（`core/xlio.py` 的 `NETSUITE_HEADER_ALIASES`）收常見的英文預設名稱
+  與欄位內部 ID。
+* **自動學習**：「🔗 NetSuite 直接抓取 → 🔤 欄名對照表 → 🔄 從 NetSuite 更新欄名對照表」
+  會讀每一支 saved search 的欄位定義（只讀欄位、不跑查詢），用「同一個欄位內部 ID 在
+  別支 saved search 有中文 Label」推出對照，存進 `mappings/欄位對照快取.json`，
+  **上傳檔案**與**直接抓取**兩條路徑共用。saved search 欄位改名後重按一次即可。
+  公式欄（內部 ID 都是 `formulatext`/`formuladate`，不同欄會撞在一起）刻意不學，
+  那些欄位請直接在 saved search 設中文 Label。
+  此功能需要 2026-09 之後版本的 RESTlet（會回傳欄位內部 ID），舊版請重新部署。
+  Streamlit Community Cloud 的檔案系統是暫時的，重啟後快取會消失；要讓它常駐，
+  把 `mappings/欄位對照快取.json` 提交進版控即可（內容只有欄名，不含機密）。
+
+轉換前的「欄位對照檢查」面板會列出每個欄位對到來源檔哪一欄。必要欄缺少會直接報錯，
+**選用欄對不上則不會報錯**（批號、效期、備註會靜默空白），所以有缺時面板會自動展開。
+
 ## 線上使用
 
 部署於 Streamlit Community Cloud，開啟網址即可使用（閒置後首次開啟需等待喚醒約 30 秒～1 分鐘）。

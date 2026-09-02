@@ -31,6 +31,8 @@ from core.m00 import convert_rows as m00_convert_rows
 from core.return_compare import _normalize_expiry as ret_normalize_expiry, _strip_dr_prefix
 from core.shipping import (
     MEMO_SOURCE_LINE,
+    describe_header_mapping,
+    header_mapping_counts,
     MEMO_SOURCE_MAIN,
     MERGE_BY_PURCHASE_ORDER,
     MODE_ORDER,
@@ -42,7 +44,14 @@ from core.shipping import (
     _split_postal,
     convert_rows as shipping_convert_rows,
 )
-from core.xlio import build_header_map, normalize_text, read_workbook, try_parse_date
+from core import xlio as xlio_mod
+from core.xlio import (
+    build_header_map,
+    has_cjk,
+    normalize_text,
+    read_workbook,
+    try_parse_date,
+)
 
 TEMPLATE_PATH = BASE_DIR / "mappings" / "HCT範本.xlsx"
 M00_TEMPLATE_PATH = BASE_DIR / "mappings" / "M00出貨格式.xlsx"
@@ -364,6 +373,190 @@ def test_netsuite_saved_search_english_headers_map_to_converter_names():
     order_columns = ["內部 ID", "文件編號", "日期", "DR_料號", "項目名稱",
                      "交易序號/批號", "出貨客戶", "備忘錄", "項目"]
     assert netsuite_mod._normalize_headers([order_columns])[0] == order_columns
+
+
+def test_netsuite_client_rejects_blank_credentials():
+    """金鑰空白時要當場講清楚。
+
+    空金鑰簽出來的 Authorization header 是 oauth_consumer_key=""，NetSuite 回
+    400 INVALID_REQUEST——跟「script id 不存在」的錯誤訊息一字不差，不擋的話
+    會被誤判成 RESTlet 部署壞掉。
+    """
+    cfg = {
+        "account_id": "11776409", "consumer_key": "", "consumer_secret": "  ",
+        "token_id": "tk", "token_secret": "ts",
+    }
+    try:
+        netsuite_mod.NetSuiteClient(cfg)
+    except netsuite_mod.NetSuiteError as exc:
+        assert "consumer_key" in str(exc) and "consumer_secret" in str(exc)
+    else:
+        raise AssertionError("金鑰空白卻沒有擋下來")
+    cfg.update(consumer_key="ck", consumer_secret="cs")
+    assert netsuite_mod.NetSuiteClient(cfg).account == "11776409"
+
+
+def test_learn_header_aliases_joins_chinese_and_english_labels():
+    """自動對照:同一個欄位內部 ID 在 A 搜尋有中文 Label、在 B 搜尋是英文預設名稱,
+    兩邊 join 起來就知道英文欄名該當成哪個中文欄名,不用人工維護對照表。
+    """
+    chinese = [
+        {"name": "tranid", "label": "文件編號"},
+        {"name": "memomain", "label": "備忘錄 (主要)"},
+        {"name": "serialnumbers", "label": "交易序號/批號"},
+        {"name": "formulatext", "label": "來源倉別"},
+        {"name": "quantity", "label": "出貨數量"},
+    ]
+    english = [
+        {"name": "tranid", "label": "Document Number"},
+        {"name": "memomain", "label": "Memo (Main)"},
+        {"name": "serialnumbers", "label": "Transaction Serial/Lot Number"},
+        {"name": "formulatext", "label": "Source Warehouse"},
+        {"name": "quantity", "label": None},          # 連 Label 都沒設
+    ]
+    aliases, rows = netsuite_mod.learn_header_aliases(
+        [("中文那支", chinese), ("英文那支", english)]
+    )
+    assert aliases["document number"] == "文件編號"
+    assert aliases["memo (main)"] == "備忘錄 (主要)"
+    assert aliases["transaction serial/lot number"] == "交易序號/批號"
+    # 欄位內部 ID 本身也要學起來(Label 完全沒設時 RESTlet 回的就是它)
+    assert aliases["tranid"] == "文件編號"
+    assert aliases["quantity"] == "出貨數量"
+    # 公式欄的內部 ID 不同欄會撞在一起,刻意不學
+    assert "source warehouse" not in aliases and "formulatext" not in aliases
+    # 對照鍵永遠不含中文:來源檔本身的中文欄名不會被自動對照改掉
+    assert not any(has_cjk(key) for key in aliases)
+    assert {r["對應中文欄名"] for r in rows} == {"文件編號", "備忘錄 (主要)", "交易序號/批號", "出貨數量"}
+
+
+def test_learn_header_aliases_prefers_label_the_converter_knows():
+    """同一個內部 ID 被不同搜尋取了不同中文名時,優先採用工具本來就認得的那個。"""
+    aliases, _rows = netsuite_mod.learn_header_aliases([
+        ("自己取名那支", [{"name": "tranid", "label": "單據號碼"}]),
+        ("標準那支", [{"name": "tranid", "label": "文件編號"}]),
+        ("英文那支", [{"name": "tranid", "label": "Document Number"}]),
+    ])
+    assert aliases["document number"] == "文件編號"
+
+
+def test_restlet_column_metadata_label_wins_but_internal_id_rescues():
+    """新版 RESTlet 回 {name,label} 時的欄名決定順序:
+
+    1. 有 Label 就以 Label 為準——自訂中文標籤(出貨數量)不可以被內部 ID 的
+       通用譯名(quantity -> 數量)蓋掉,否則轉換反而找不到欄位。
+    2. Label 是英文預設名稱時照對照表譯成中文。
+    3. Label 認不得、但內部 ID 對得上某個必要欄位且整份報表都沒有該欄時,
+       才用內部 ID 補救。
+    4. 舊版 RESTlet 只回字串,行為要跟以前完全一樣。
+    """
+    header = netsuite_mod._normalize_headers([[
+        {"name": "quantity", "label": "出貨數量"},
+        {"name": "tranid", "label": "Document Number"},
+        {"name": "trandate", "label": "Posting Period Date"},
+        {"name": "displayname", "label": None},
+    ]])[0]
+    assert header[0] == "出貨數量"      # 自訂中文標籤原樣保留
+    assert header[1] == "文件編號"      # 英文預設名稱譯成中文
+    assert header[2] == "日期"          # 認不得的 Label + 內部 ID 對得上必要欄位
+    assert header[3] == "顯示名稱"      # 沒有 Label 時退到內部 ID
+
+    # 內部 ID 補救只在該必要欄位真的缺席時才介入
+    header = netsuite_mod._normalize_headers([[
+        {"name": "trandate", "label": "Posting Period Date"},
+        {"name": "custcol_x", "label": "日期"},
+    ]])[0]
+    assert header == ["Posting Period Date", "日期"]
+
+    # 舊版 RESTlet(字串陣列)
+    assert netsuite_mod._normalize_headers([["Document Number", "出貨數量"]])[0] == [
+        "文件編號", "出貨數量",
+    ]
+
+
+def test_header_alias_cache_extends_upload_path():
+    """學回來的對照存成檔案,是為了讓沒連 NetSuite 的「上傳檔案」路徑也吃得到。"""
+    import tempfile
+
+    original = xlio_mod.HEADER_ALIAS_CACHE_PATH
+    with tempfile.TemporaryDirectory() as tmp:
+        xlio_mod.HEADER_ALIAS_CACHE_PATH = Path(tmp) / "cache.json"
+        try:
+            xlio_mod.save_header_alias_cache({"Lot Number": "交易序號/批號"}, [])
+            headers = build_header_map(["Lot Number", "出貨數量"])
+            xlio_mod.apply_netsuite_header_aliases(headers)
+            assert headers["交易序號/批號".casefold()] == 0
+            # 內建表優先:同一個鍵兩邊都有時以人工驗證過的為準
+            xlio_mod.save_header_alias_cache({"date": "亂七八糟"}, [])
+            assert xlio_mod.header_aliases()["date"] == "日期"
+        finally:
+            xlio_mod.HEADER_ALIAS_CACHE_PATH = original
+            xlio_mod.load_header_alias_cache(refresh=True)
+
+
+def test_describe_header_mapping_flags_silent_gaps():
+    """轉換前的欄位對照預檢:自動對應要看得出來,選用欄缺少要講後果(不是靜默空白)。"""
+    header = [
+        "內部 ID", "文件編號", "日期", "DR_料號", "顯示名稱",
+        "Transaction Serial/Lot Number", "來源倉別", "出貨數量", "倉儲",
+        "倉儲聯繫人", "倉儲電話", "倉儲地址", "Memo (Main)", "Item",
+        "目標地點", "DR_預計到貨日期", "DR_預計到貨時段",
+    ]
+    rows = {r["欄位"]: r for r in describe_header_mapping(
+        header, MODE_TRANSFER, MEMO_SOURCE_MAIN, MERGE_BY_PURCHASE_ORDER
+    )}
+    assert rows["序號/批號"]["來源欄位"] == "Transaction Serial/Lot Number"
+    assert rows["序號/批號"]["狀態"] == "✅ 已自動對應"
+    assert rows["DR_溫馨提醒"]["來源欄位"] == "Memo (Main)"
+    assert rows["文件編號"]["狀態"] == "✅ 對應"
+    assert rows["虛擬倉來源"]["來源欄位"] == "來源倉別"
+    # 沒有的選用欄要明講後果,不能只說「缺少」
+    assert rows["客戶採購單編號"]["狀態"].startswith("⚠️ 缺少 — 無法以採購單合併")
+    missing_required, missing_optional = header_mapping_counts(list(rows.values()))
+    assert missing_required == 0 and missing_optional >= 1
+
+    # 必要欄真的缺就要標成無法轉換
+    broken = [h for h in header if h not in ("文件編號", "日期")]
+    rows = {r["欄位"]: r for r in describe_header_mapping(broken, MODE_TRANSFER)}
+    assert rows["日期"]["狀態"].startswith("❌")
+    assert header_mapping_counts(list(rows.values()))[0] == 2
+
+
+def test_upload_transfer_report_with_english_default_headers():
+    """手動匯出的調撥單報表中英混雜時,上傳路徑也要認得英文預設欄名。
+
+    欄名取自實際匯出檔(調撥單未出貨明細物流專用):有設中文 Label 的欄
+    (內部 ID/文件編號/日期/來源倉別…)是中文,沒設的退回英文
+    (Transaction Serial/Lot Number、Memo (Main)、Transaction Line Type)。
+    過去英中對照只掛在 RESTlet 直接抓取那條路徑,所以同一支 saved search
+    「直接抓取」會過、「下載成檔案再上傳」卻出事,而且兩種出事方式都要擋:
+      1. 文件編號/日期/項目 是英文 -> 必要欄檢查直接擋下(來源檔缺少必要欄位)
+      2. 批號/備忘錄 是英文 -> 不擋,默默輸出空白效期與空白備註
+    """
+    header = [
+        "Internal ID", "Document Number", "Date", "DR_料號", "顯示名稱",
+        "Transaction Serial/Lot Number", "來源倉別", "目標倉別", "出貨數量",
+        "倉儲", "倉儲聯繫人", "倉儲電話", "倉儲地址", "Memo (Main)",
+        "Transaction Line Type", "Item", "來源地點", "目標地點",
+        "DR_預計到貨日期", "DR_預計到貨時段",
+    ]
+    row = [
+        "75939", "TO-000264", "2026-09-02", "101031250014", "玻尿酸保濕精華化妝水150ML",
+        "20290801", "G30 台北倉", "C13", "24",
+        "C13", "Ariel", "0225179888", "104 台北市中山區南京東路三段70號13樓", "0901進貨QB",
+        "出貨", "101031250014_HHT150A", "G30_台北倉", "C13_達爾膚-品檢倉",
+        "2026-09-03", "早(9-12)",
+    ]
+    result = shipping_convert_rows(
+        [header, row], MODE_TRANSFER, TEMPLATE_PATH, memo_source=MEMO_SOURCE_MAIN,
+    )
+    assert result.output_items == 1
+    assert _output_cell(result, 2, 1) == "TO-000264"          # Document Number
+    assert _output_cell(result, 2, 3) == "101031250014"        # Item(料號空白時的備援來源)
+    assert _output_cell(result, 2, 7) == "20290801"            # 批號 <- Transaction Serial/Lot Number
+    assert str(_output_cell(result, 2, 33)).startswith("2029-08-01")   # 效期
+    assert "0901進貨QB" in _output_cell(result, 2, 19)          # 備註 <- Memo (Main)
+    assert _output_cell(result, 2, 30) == "G30"                # 來源倉別仍正常
 
 
 def test_compare_quantity_key_uses_normalized_expiry():
