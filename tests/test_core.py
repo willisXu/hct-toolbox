@@ -494,6 +494,51 @@ def test_header_alias_cache_extends_upload_path():
             xlio_mod.load_header_alias_cache(refresh=True)
 
 
+def test_header_alias_cache_merges_and_survives_partial_failure():
+    """對照快取只增不刪。
+
+    refresh 是一支一支 saved search 讀的,任何一支失敗(token 過期、搜尋被改名、
+    NetSuite 暫時不通)就只會拿到剩下那幾支的對照。若整份覆蓋,只有那一支學得到
+    的欄名會被默默刪掉,靜默空白欄就又回來了——正是這個功能要防的事。
+    """
+    import tempfile
+
+    class FakeClient:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def fetch_search_columns(self, url, search_id):
+            if search_id not in self.ok:
+                raise netsuite_mod.NetSuiteError("模擬讀取失敗")
+            return {
+                "A": [{"name": "tranid", "label": "文件編號"}],
+                "B": [{"name": "tranid", "label": "Document Number"},
+                      {"name": "custbody_dr_sotype", "label": "銷售訂單類型"},
+                      {"name": "custbody_dr_sotype", "label": "SO Type"}],
+            }[search_id]
+
+    searches = [{"label": "A", "search_id": "A"}, {"label": "B", "search_id": "B"}]
+    original = xlio_mod.HEADER_ALIAS_CACHE_PATH
+    with tempfile.TemporaryDirectory() as tmp:
+        xlio_mod.HEADER_ALIAS_CACHE_PATH = Path(tmp) / "cache.json"
+        try:
+            first, _rows, _notes = netsuite_mod.refresh_header_aliases(
+                FakeClient({"A", "B"}), "url", searches
+            )
+            assert "document number" in first
+            # B 這次讀失敗:只會拿到 A 的對照,但先前學到的不可以消失
+            _second, _rows, notes = netsuite_mod.refresh_header_aliases(
+                FakeClient({"A"}), "url", searches
+            )
+            assert any("讀取欄位定義失敗" in note for note in notes)
+            kept = xlio_mod.load_header_alias_cache(refresh=True)["aliases"]
+            assert "document number" in kept, "部分失敗把先前學到的對照洗掉了"
+            assert xlio_mod.header_aliases()["document number"] == "文件編號"
+        finally:
+            xlio_mod.HEADER_ALIAS_CACHE_PATH = original
+            xlio_mod.load_header_alias_cache(refresh=True)
+
+
 def test_describe_header_mapping_flags_silent_gaps():
     """轉換前的欄位對照預檢:自動對應要看得出來,選用欄缺少要講後果(不是靜默空白)。"""
     header = [

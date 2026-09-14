@@ -191,7 +191,11 @@ def _convert_tab(mode: str, title: str, source_hint: str, key_prefix: str) -> No
         except Exception as exc:  # noqa: BLE001 - 讀不到欄名列就交給轉換時報錯
             st.warning(f"讀取欄名列失敗，無法先做欄位對照檢查：{exc}")
         else:
-            _header_check_panel(header_row, mode, memo_source, merge_by)
+            # M00 一律不合併，預檢面板不該把「客戶採購單編號」標成目前選的合併方式
+            _header_check_panel(
+                header_row, mode, memo_source,
+                merge_by if output_format == FORMAT_HCT else shipping.MERGE_BY_RECIPIENT,
+            )
 
     if uploaded is not None and st.button("🚀 開始轉換", key=f"{key_prefix}_run", type="primary"):
         try:
@@ -549,8 +553,9 @@ with tab_netsuite:
 
             # 品名欄漏抓時要講清楚，否則轉出的檔案品名整欄空白卻沒有任何提示。
             # 常見原因：saved search 該欄沒設自訂 Label，RESTlet 只能回欄位內部
-            # ID（netsuite.py 的 _HEADER_ALIASES 已收常見寫法）；若欄名不在對照
-            # 表裡、或 saved search 根本沒加這欄，就得回 NetSuite 補。
+            # ID（xlio.py 的 NETSUITE_HEADER_ALIASES 已收常見寫法）；欄名不在對照
+            # 表裡時，先按下方「🔤 欄名對照表 → 更新」讓它從別支 saved search 自動
+            # 學一次，還是對不上（例如公式欄）才需要回 NetSuite 補中文 Label。
             if not any(name in ns_columns for name in ("項目名稱", "顯示名稱")):
                 st.warning(
                     "這批資料裡找不到品名欄（需要「項目名稱」或「顯示名稱」），"
@@ -688,7 +693,10 @@ with tab_netsuite:
                 ns_memo_source = _memo_source_radio("ns_memo_source")
                 ns_merge_by = _merge_by_radio("ns_merge_by")
 
-                _header_check_panel(ns_rows[0], ns_mode, ns_memo_source, ns_merge_by)
+                _header_check_panel(
+                    ns_rows[0], ns_mode, ns_memo_source,
+                    ns_merge_by if ns_format == FORMAT_HCT else shipping.MERGE_BY_RECIPIENT,
+                )
 
                 if st.button("🚀 開始轉換", key="ns_run", type="primary"):
                     if not visible_selected:
@@ -810,7 +818,11 @@ with tab_netsuite:
         if alias_result:
             aliases, alias_rows, notes = alias_result
             if aliases:
-                st.success(f"學到 {len(aliases)} 組欄名對照，已存進 mappings/欄位對照快取.json。")
+                total = len(xlio_mod.load_header_alias_cache(refresh=True).get("aliases") or {})
+                st.success(
+                    f"這次學到 {len(aliases)} 組欄名對照，快取合計 {total} 組"
+                    "（累積合併，某支 saved search 讀取失敗不會把先前學到的洗掉）。"
+                )
                 st.dataframe(pd.DataFrame(alias_rows), use_container_width=True, hide_index=True)
             else:
                 st.warning("這次沒有學到任何對照（見下方訊息）。")

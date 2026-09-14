@@ -239,11 +239,19 @@ def load_header_alias_cache(refresh: bool = False) -> dict:
 
 
 def save_header_alias_cache(aliases: dict[str, str], sources: list[dict]) -> Path:
-    """把學到的對照寫成檔案，並讓後續呼叫立刻吃到新的內容。"""
+    """把學到的對照寫進檔案（累積合併），並讓後續呼叫立刻吃到新的內容。
+
+    刻意「只增不刪」：refresh 是一支一支 saved search 讀的，任何一支失敗（token
+    過期、搜尋被改名、NetSuite 暫時不通）就只會拿到剩下那幾支的對照。整份覆蓋的話，
+    只有那一支學得到的欄名會被默默刪掉，靜默空白欄就又回來了——正是這個功能要防的
+    事。欄位真的改名時，新的對照會蓋掉同名鍵；殘留的舊鍵頂多是沒人用到的死鍵。
+    """
     global _learned_cache
+    merged = dict(load_header_alias_cache().get("aliases") or {})
+    merged.update({str(k).casefold(): str(v) for k, v in aliases.items()})
     payload = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "aliases": {str(k).casefold(): str(v) for k, v in aliases.items()},
+        "aliases": dict(sorted(merged.items())),
         "sources": sources,
     }
     HEADER_ALIAS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
