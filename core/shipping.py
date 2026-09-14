@@ -4,7 +4,7 @@
 由 VBA modHCTConverter360 / modHCTConverter162 移植（第 4 點為移植後新增）：
   1. 依「預計到貨日 + 出貨客戶 + 門市/倉儲 + 地址」判斷可否跨單合併；
      同收件條件有 >=2 種訂單類型且含「一般銷售訂單」時合併為一張送貨單。
-  2. 同送貨單內相同「料號 + 效期」的明細數量加總。
+  2. 同送貨單內相同「料號 + 效期 + 倉別」的明細數量加總；出貨倉不同即分列。
   3. 輸出 36 欄 HCT 銷貨報表（欄位常數取自 HCT範本）。
   4. 虛擬倉（AD 欄）：來源報表有倉別/地點/來源倉別欄時逐列帶出 G 開頭代碼；
      沒有該欄（或該列空白）時，料號 9 開頭（陳列/宣傳品，存 G90 倉）
@@ -856,17 +856,13 @@ def _add_row_to_shipment(
         _add_distinct(warnings, warehouse_warning)
         _add_distinct(shipment.warnings, warehouse_warning)
 
-    item_key = (material, expiry_key)
+    # 合併鍵含倉別：同料號同效期但出貨倉不同（如 G10 407 + G30 20）是兩筆
+    # 不同的實際出貨，過去只用（料號, 效期）會加總成一筆、倉別取前列，
+    # 407+20 直接變成 G10 427。輸出第 30 欄本來就是逐列的虛擬倉，分開寫即可。
+    item_key = (material, expiry_key, warehouse)
     item = shipment.items.get(item_key)
     if item is not None:
         item["quantity"] += quantity
-        if item["warehouse"] != warehouse:
-            text = (
-                f"第 {row_number} 列料號 {material} 倉別（{warehouse or '預設'}）"
-                f"與同單前列（{item['warehouse'] or '預設'}）不一致，輸出以前列為準。"
-            )
-            _add_distinct(warnings, text)
-            _add_distinct(shipment.warnings, text)
     else:
         shipment.items[item_key] = {
             "material": material,

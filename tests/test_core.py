@@ -932,6 +932,31 @@ def test_e2e_warehouse_from_source_location_column():
     assert any("無法辨識" in w for w in result.warnings)
 
 
+def test_e2e_same_item_different_warehouse_not_merged():
+    """同料號同效期但出貨倉不同要分開兩列,不能加總成一筆。
+
+    實際出事的單:SO-DW-260901595 業務打 G10*407 + G30*20,轉單只出一列
+    G10*427——明細合併鍵只有(料號, 效期),倉別取前列就把 G30 的 20 支
+    併進 G10 了。輸出第 30 欄本來就是逐列的虛擬倉,兩列各自帶自己的倉別。
+    """
+    header = _E2E_HEADER + ["倉別"]
+    g10 = _e2e_row("2027-05-01", 407) + ["G10"]
+    g30 = _e2e_row("2027-05-01", 20) + ["G30"]
+    result = shipping_convert_rows([header, g10, g30], MODE_ORDER, TEMPLATE_PATH)
+    assert result.output_items == 2
+    assert (_output_cell(result, 2, 30), _output_cell(result, 2, 8)) == ("G10", 407)
+    assert (_output_cell(result, 3, 30), _output_cell(result, 3, 8)) == ("G30", 20)
+
+
+def test_e2e_same_item_same_warehouse_still_merged():
+    """同料號同效期同倉別照舊加總成一列(加了倉別鍵不影響原本的合併)。"""
+    header = _E2E_HEADER + ["倉別"]
+    rows = [header, _e2e_row("2027-05-01", 407) + ["G10"], _e2e_row("2027-05-01", 20) + ["G10"]]
+    result = shipping_convert_rows(rows, MODE_ORDER, TEMPLATE_PATH)
+    assert result.output_items == 1
+    assert _output_cell(result, 2, 8) == 427
+
+
 def test_e2e_warehouse_display_material_falls_back_to_g90():
     """來源沒有倉別欄時，料號 9 開頭（陳列/宣傳品）輸出 G90 並附警告。"""
     normal = _e2e_row("2027-05-01", 10)
