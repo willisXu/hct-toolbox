@@ -7,6 +7,7 @@ NetSuite 匯出的 .xls 其實是 SpreadsheetML XML；HCT 系統匯出的 .xls �
 """
 from __future__ import annotations
 
+import csv
 import io
 import json
 import re
@@ -32,7 +33,36 @@ def read_workbook(data: bytes, filename: str = "") -> dict[str, list[list[object
         return _read_biff(data, filename)
     if data[:2] == b"PK":
         return _read_openxml(data, filename)
+    if filename.lower().endswith((".csv", ".txt")) or _looks_like_csv(head):
+        return _read_csv(data, filename)
     raise ValueError(f"無法辨識的檔案格式：{filename}")
+
+
+def _looks_like_csv(head: bytes) -> bool:
+    """沒有副檔名線索時，第一列有逗號分隔且不含控制字元就當 CSV。"""
+    first_line = head.split(b"\n", 1)[0]
+    if b"," not in first_line:
+        return False
+    return not any(byte < 9 or 13 < byte < 32 for byte in first_line)
+
+
+def _read_csv(data: bytes, filename: str = "") -> dict[str, list[list[object]]]:
+    """CSV：NetSuite saved search 匯出的是 UTF-8（BOM 已在上游去掉），舊工具
+    匯出的可能是 Big5。所有值都以字串回傳，交由各模組自行解析數字／日期。"""
+    text = None
+    for encoding in ("utf-8", "cp950"):
+        try:
+            text = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError(f"讀取檔案失敗：{filename}\nCSV 內容不是 UTF-8 也不是 Big5 編碼")
+    rows: list[list[object]] = [
+        list(row) for row in csv.reader(io.StringIO(text))
+        if any(value.strip() for value in row)
+    ]
+    return {"Sheet1": _pad_rows(rows)}
 
 
 def _read_spreadsheetml(data: bytes, filename: str = "") -> dict[str, list[list[object]]]:

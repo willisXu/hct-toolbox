@@ -241,6 +241,101 @@ def test_inventory_ns_lot_does_not_collide_with_contract_format():
     assert inventory.detect_source(contract, "c.xls") == inventory.SYSTEM_CONTRACT
 
 
+_NS_PURCHASE_HEADER = [
+    "項目內部ID", "項目", "DR_料號", "顯示名稱", "DR_存貨型態", "倉別", "倉別名稱", "地點",
+    "DR_地點功能性分類", "DR_通路倉儲分類", "庫存編號", "基準日結存", "當日入庫", "當日出庫",
+    "在庫量(現在)", "單位", "小數標記", "最後入庫日", "最後入庫單號", "入庫類型",
+    "入庫當日結存", "庫齡天數",
+]
+
+
+def _ns_purchase_row(item, name, loc, loc_name, lot, opening, in_qty, out_qty, on_hand,
+                     dr_item=None):
+    code = item.split("_", 1)[0] if dr_item is None else dr_item
+    return [
+        "12", item, code, name, "正貨", loc, loc_name, f"{loc}_{loc_name}", "寄售銷售倉",
+        "寄售倉", lot, opening, in_qty, out_qty, on_hand, "PCS", "0", "", "", "", "", "",
+    ]
+
+
+def _csv_bytes(rows: list[list[str]], encoding: str = "utf-8-sig") -> bytes:
+    import csv as _csv
+    import io as _io
+
+    buffer = _io.StringIO()
+    _csv.writer(buffer, lineterminator="\n").writerows(rows)
+    return buffer.getvalue().encode(encoding)
+
+
+def test_inventory_ns_purchase_csv_reconcile_against_hct():
+    """NetSuite 採購核對版 CSV × HCT:倉別代碼當倉別、庫存編號當效期、
+    在庫量(現在) 單欄兩用；基準日結存／當日入出庫是異動欄，不參與核對。"""
+    ns_csv = _csv_bytes([
+        _NS_PURCHASE_HEADER,
+        _ns_purchase_row("101021250008_HHK150A", "潔顏凝露150ML", "J12", "momo倉",
+                         "20290301", "120", "400", "400", "120"),
+        _ns_purchase_row("101051190015_HHL050A", "精華乳50ML", "J12", "momo倉",
+                         "20290401", "960", "960", "0", "960"),
+        # 外倉列:基準日結存／入出庫都是 0，只有在庫量(現在)有值
+        _ns_purchase_row("101051190015_HHL050A", "精華乳50ML", "M00", "Boxful-南工倉",
+                         "20290401", "0", "0", "0", "1392"),
+        # DR_料號空白時退回「項目」底線前段
+        _ns_purchase_row("29724012_HHK150A", "潔顏凝露 特惠組", "J12", "momo倉",
+                         "20290301", "715", "400", "0", "715", dr_item=""),
+    ])
+    assert ns_csv[:3] == b"\xef\xbb\xbf"
+    assert inventory.detect_source(ns_csv, "庫存報表_採購核對_2026-09-29.csv") \
+        == inventory.SYSTEM_NETSUITE_PURCHASE
+
+    hct = _spreadsheetml([
+        ["儲區類別", "客戶產品編號", "產品名稱", "有效日期", "可出數量", "庫存數量"],
+        ["J12", "101021250008", "潔顏凝露150ML", "20290301", "120", "120"],
+        ["J12", "101051190015", "精華乳50ML", "20290401", "950", "960"],
+        ["J12", "29724012", "潔顏凝露 特惠組", "20290301", "715", "715"],
+    ])
+
+    result = inventory.reconcile(hct, "h.xls", ns_csv, "庫存報表_採購核對_2026-09-29.csv")
+    assert result.ext_label == inventory.SYSTEM_HCT
+    assert result.ns_stats.sheet_name == "Sheet1"
+    assert result.ns_stats.rows_read == 4
+    assert result.ns_stats.valid_rows == 4
+    assert result.anomalies == []
+
+    by_key = {(r["倉別"], r["料號"]): r for r in result.detail_rows}
+    assert by_key[("J12", "101021250008")]["狀態"] == inventory.STATUS_MATCH
+    assert by_key[("J12", "101021250008")]["NetSuite 數量"] == 120   # 不是 400 也不是 基準日
+    assert str(by_key[("J12", "101021250008")]["到期日"]) == "2029-03-01"
+    assert by_key[("J12", "101021250008")]["批號"] == "20290301"
+    assert by_key[("J12", "101021250008")]["品名／項目"] == "潔顏凝露150ML"
+    # 在庫量(現在) 單欄兩用:HCT 可出 950 / 庫存 960 → 僅可用量差異
+    assert by_key[("J12", "101051190015")]["狀態"] == inventory.STATUS_AVAILABLE_DIFF
+    assert by_key[("J12", "101051190015")]["NetSuite 項目計數"] == 960
+    assert by_key[("M00", "101051190015")]["狀態"] == inventory.STATUS_NS_ONLY
+    assert by_key[("M00", "101051190015")]["NetSuite 數量"] == 1392
+    assert by_key[("J12", "29724012")]["狀態"] == inventory.STATUS_MATCH
+
+
+def test_inventory_ns_purchase_csv_big5_and_fullwidth_parens():
+    """Big5 編碼、欄名寫成全形括號「在庫量（現在）」也要認得。"""
+    header = list(_NS_PURCHASE_HEADER)
+    header[header.index("在庫量(現在)")] = "在庫量（現在）"
+    ns_csv = _csv_bytes([
+        header,
+        _ns_purchase_row("101021250008_HHK150A", "潔顏凝露150ML", "G10", "新竹倉",
+                         "20290301", "5", "0", "0", "5"),
+    ], encoding="cp950")
+    assert inventory.detect_source(ns_csv, "ns.csv") == inventory.SYSTEM_NETSUITE_PURCHASE
+
+
+def test_inventory_ns_purchase_does_not_collide_with_663():
+    """663 物流核對版有「在庫量」＋「可用」但沒有「在庫量(現在)」，兩者不可互相誤判。"""
+    ns663 = _spreadsheetml([
+        ["項目", "DR_料號", "地點", "庫存編號", "在庫量", "可用"],
+        ["101021250008_HHK150A", "101021250008", "G10_新竹倉", "20290301", "5", "5"],
+    ])
+    assert inventory.detect_source(ns663, "ns.xls") == inventory.SYSTEM_NETSUITE_663
+
+
 def test_inventory_m00_reconcile_sums_qty_plus_reserved():
     """M00 庫存詳情 × NetSuite：庫存量＝數量＋組合保留，整份視為 M00 倉。"""
     m00 = _spreadsheetml([

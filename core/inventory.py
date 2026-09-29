@@ -3,6 +3,9 @@
 
   - NetSuite 報表欄位：地點、到期日、DR_料號、項目計數 總和、數量 總和
   - NetSuite 批號版報表欄位：料號、品名、倉別代碼、倉別名稱、批號、在庫數量
+  - NetSuite 採購核對版報表(2026-09 起的 CSV 匯出)欄位：項目、DR_料號、顯示名稱、
+    倉別、庫存編號、在庫量(現在)；倉別直接是代碼欄、效期在庫存編號欄，
+    在庫量(現在)同時當作可用量與總庫存量
   - HCT 報表欄位：儲區類別、有效日期、客戶產品編號、可出數量、庫存數量
   - 代工廠報表欄位：庫存日期、倉別、品號、品名、批號、庫存數量
   - M00 報表(電商物流 InventorySummaryReport)：取「庫存詳情」分頁，
@@ -73,6 +76,14 @@ _NS663_HEADERS = ["項目", "DR_料號", "地點", "庫存編號", "在庫量", 
 # 必要欄位刻意不含「倉別名稱」：代工廠報表也有 倉別名稱／品名／批號，
 # 靠 料號＋倉別代碼＋在庫數量 三欄才能跟它區隔開，避免同時命中兩種格式。
 _NS_LOT_HEADERS = ["料號", "品名", "倉別代碼", "批號", "在庫數量"]
+# 採購核對版 NetSuite 庫存報表（2026-09 起，CSV 匯出）：倉別直接是代碼欄
+# （J12、M00…，另有「倉別名稱／地點」僅供參考），效期在「庫存編號」欄
+# (yyyymmdd)，只有一個「在庫量(現在)」數量欄，同時當作可用量與總庫存量；
+# 料號用 DR_料號（空白時取「項目」底線前段），品名用「顯示名稱」。
+# 「基準日結存／當日入庫／當日出庫」是異動追蹤欄，不參與核對——外倉那些列
+# 三欄都是 0 但在庫量(現在)有值，拿它們核對會全錯。
+# 跟 663 格式靠「在庫量(現在)」區隔（663 是「在庫量」＋「可用」）。
+_NS_PURCHASE_HEADERS = ["項目", "DR_料號", "倉別", "庫存編號", "在庫量(現在)"]
 _HCT_HEADERS = ["客戶產品編號", "有效日期", "儲區類別", "可出數量", "庫存數量"]
 # 代工廠庫存核對報表：只有一個「庫存數量」欄，同時當作可用量與總庫存量；
 # 「批號」放到期日欄位(目前多為空白＝無到期日)，「合計／總計」小計列會被排除。
@@ -88,6 +99,7 @@ _M00_NO_EXPIRY_MARKS = {"-", "—", "–", "‑", "－"}
 SYSTEM_NETSUITE_293 = "NetSuite293"
 SYSTEM_NETSUITE_663 = "NetSuite663"
 SYSTEM_NETSUITE_LOT = "NetSuite批號版"
+SYSTEM_NETSUITE_PURCHASE = "NetSuite採購核對版"
 
 
 class InventoryError(ValueError):
@@ -124,7 +136,9 @@ class InventoryResult:
 
 def _normalize_header(value: object) -> str:
     text = "" if value is None else str(value)
-    return text.replace("\xa0", " ").replace("　", " ").strip()
+    text = text.replace("\xa0", " ").replace("　", " ")
+    # 全形括號一律視同半形：「在庫量（現在）」與「在庫量(現在)」是同一欄。
+    return text.replace("（", "(").replace("）", ")").strip()
 
 
 def _normalize_item(value: object) -> str:
@@ -215,6 +229,8 @@ def detect_source(data: bytes, filename: str) -> str:
         matches.append(SYSTEM_NETSUITE_293)
     if _find_matching_sheet(book, _NS_LOT_HEADERS):
         matches.append(SYSTEM_NETSUITE_LOT)
+    if _find_matching_sheet(book, _NS_PURCHASE_HEADERS):
+        matches.append(SYSTEM_NETSUITE_PURCHASE)
     if _find_matching_sheet(book, _HCT_HEADERS):
         matches.append(SYSTEM_HCT)
     if _find_matching_sheet(book, _CONTRACT_HEADERS):
@@ -249,6 +265,8 @@ def _import_source(data: bytes, filename: str, system: str,
         required = _NS663_HEADERS
     elif system == SYSTEM_NETSUITE_LOT:
         required = _NS_LOT_HEADERS
+    elif system == SYSTEM_NETSUITE_PURCHASE:
+        required = _NS_PURCHASE_HEADERS
     else:
         required = _NS_HEADERS
     match = _find_matching_sheet(book, required)
@@ -303,6 +321,16 @@ def _import_source(data: bytes, filename: str, system: str,
         if desc_col is None:
             desc_col = col("項目")
         field_names = ("地點", "DR_料號", "庫存編號", "可用", "在庫量")
+        item_fallback_col = col("項目")
+    elif system == SYSTEM_NETSUITE_PURCHASE:
+        # 倉別欄就是代碼（J12、M00…）；在庫量(現在) 單欄兩用。
+        location_col, item_col = col("倉別"), col("DR_料號")
+        expiry_col = col("庫存編號")
+        available_col = total_col = col("在庫量(現在)")
+        desc_col = col("顯示名稱")
+        if desc_col is None:
+            desc_col = col("項目")
+        field_names = ("倉別", "DR_料號", "庫存編號", "在庫量(現在)", "在庫量(現在)")
         item_fallback_col = col("項目")
     else:
         location_col, item_col = col("地點"), col("DR_料號")
@@ -481,7 +509,7 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
             f"無法辨識檔案:{hct_name}(找不到 NetSuite、HCT、代工廠或 M00 報表的必要欄位)")
 
     ns_variants = (SYSTEM_NETSUITE, SYSTEM_NETSUITE_293, SYSTEM_NETSUITE_663,
-                   SYSTEM_NETSUITE_LOT)
+                   SYSTEM_NETSUITE_LOT, SYSTEM_NETSUITE_PURCHASE)
     ext_variants = (SYSTEM_HCT, SYSTEM_CONTRACT, SYSTEM_M00)
     if first_system in ext_variants and second_system in ns_variants:
         ns_data, hct_data = hct_data, ns_data

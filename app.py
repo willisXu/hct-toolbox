@@ -1054,7 +1054,8 @@ with tab_inventory:
     st.markdown(
         "上傳 **HCT（或代工廠、M00）庫存報表** 與 **NetSuite 庫存報表** 各一份，順序不限，"
         "程式會自動辨識。\n\n"
-        "NetSuite 報表支援四種格式：物流核對版（DR_料號/庫存編號/在庫量/可用）、"
+        "NetSuite 報表支援五種格式：採購核對版（CSV 匯出，DR_料號/倉別/庫存編號/在庫量(現在)）、"
+        "物流核對版（DR_料號/庫存編號/在庫量/可用）、"
         "業務助理版（項目/庫存數 總和）、批號版（料號/倉別代碼/批號/在庫數量）、"
         "舊版（DR_料號/項目計數 總和/數量 總和）。\n\n"
         "另一份可以是 **HCT 庫存報表**（儲區類別/客戶產品編號/有效日期/可出數量/庫存數量）、"
@@ -1073,9 +1074,9 @@ with tab_inventory:
     )
     col1, col2 = st.columns(2)
     with col1:
-        inv_a = st.file_uploader("檔案一", type=["xls", "xlsx", "xlsm"], key="inv_a")
+        inv_a = st.file_uploader("檔案一", type=["xls", "xlsx", "xlsm", "csv"], key="inv_a")
     with col2:
-        inv_b = st.file_uploader("檔案二", type=["xls", "xlsx", "xlsm"], key="inv_b")
+        inv_b = st.file_uploader("檔案二", type=["xls", "xlsx", "xlsm", "csv"], key="inv_b")
 
     if inv_a is not None and inv_b is not None:
         if st.button("🚀 開始核對", key="inv_run", type="primary"):
