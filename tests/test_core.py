@@ -315,6 +315,36 @@ def test_inventory_ns_purchase_csv_reconcile_against_hct():
     assert by_key[("J12", "29724012")]["狀態"] == inventory.STATUS_MATCH
 
 
+def test_inventory_contract_against_ns_purchase_uses_opening_balance():
+    """代工廠 × NetSuite 採購核對版:NetSuite 側改用「基準日結存」核對，
+    不是在庫量(現在)。"""
+    ns_csv = _csv_bytes([
+        _NS_PURCHASE_HEADER,
+        # 基準日結存 100、當日出庫 30 → 在庫量(現在) 70
+        _ns_purchase_row("300020400025_X", "品A", "D01", "凱芬妮倉",
+                         "", "100", "0", "30", "70"),
+        _ns_purchase_row("300020400026_X", "品B", "D01", "凱芬妮倉",
+                         "", "40", "20", "0", "60"),
+    ])
+    contract = _spreadsheetml([
+        ["庫存日期", "倉別", "倉別名稱", "品號", "品名", "批號", "庫存數量"],
+        ["20260724", "D01", "凱芬妮倉", "300020400025", "品A", "", "100"],
+        ["20260724", "D01", "凱芬妮倉", "300020400026", "品B", "", "60"],
+        ["", "", "總計", "", "", "", "160"],
+    ])
+
+    result = inventory.reconcile(ns_csv, "ns.csv", contract, "c.xls")
+    assert result.ext_label == inventory.SYSTEM_CONTRACT
+    assert result.anomalies == []
+    by_item = {r["料號"]: r for r in result.item_rows}
+    assert by_item["300020400025"]["NetSuite 數量"] == 100
+    assert by_item["300020400025"]["NetSuite 項目計數"] == 100
+    assert by_item["300020400025"]["狀態"] == inventory.STATUS_MATCH
+    assert by_item["300020400026"]["NetSuite 數量"] == 40
+    assert by_item["300020400026"]["總庫存差額"] == 20
+    assert by_item["300020400026"]["狀態"] == inventory.STATUS_BOTH_DIFF
+
+
 def test_inventory_ns_purchase_csv_big5_and_fullwidth_parens():
     """Big5 編碼、欄名寫成全形括號「在庫量（現在）」也要認得。"""
     header = list(_NS_PURCHASE_HEADER)

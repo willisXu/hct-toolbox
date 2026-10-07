@@ -19,6 +19,8 @@
     核對鍵：M00 報表沒有倉別欄，整份強制視為 M00 倉，NetSuite 側若不限定
     範圍，每一筆非 M00 倉都會變成假的「僅 NetSuite 存在」。
   - 代工廠報表只有一個「庫存數量」欄，同時當作可用量與總庫存量(同 293 格式)。
+  - 代工廠 × NetSuite 採購核對版：NetSuite 側改用「基準日結存」核對
+    (而非在庫量(現在))，對齊代工廠報表的庫存日期結存。
   - 以「倉別+料號+到期日」做日期明細核對，另以「倉別+料號」做料號彙總核對。
   - 日期明細除了「到期日」(日期格式)另留一欄「批號」(yyyymmdd 文字格式)，
     對應各報表批號欄的原始寫法，方便直接拿去 NetSuite／倉儲系統查該批貨。
@@ -80,10 +82,12 @@ _NS_LOT_HEADERS = ["料號", "品名", "倉別代碼", "批號", "在庫數量"]
 # （J12、M00…，另有「倉別名稱／地點」僅供參考），效期在「庫存編號」欄
 # (yyyymmdd)，只有一個「在庫量(現在)」數量欄，同時當作可用量與總庫存量；
 # 料號用 DR_料號（空白時取「項目」底線前段），品名用「顯示名稱」。
-# 「基準日結存／當日入庫／當日出庫」是異動追蹤欄，不參與核對——外倉那些列
-# 三欄都是 0 但在庫量(現在)有值，拿它們核對會全錯。
+# 「基準日結存／當日入庫／當日出庫」是異動追蹤欄，HCT／M00 對帳不用——外倉
+# 那些列三欄都是 0 但在庫量(現在)有值，拿它們核對會全錯。
+# 代工廠對帳例外：代工廠報表是「庫存日期」當天的結存，改用「基準日結存」核對。
 # 跟 663 格式靠「在庫量(現在)」區隔（663 是「在庫量」＋「可用」）。
 _NS_PURCHASE_HEADERS = ["項目", "DR_料號", "倉別", "庫存編號", "在庫量(現在)"]
+_NS_PURCHASE_OPENING_COL = "基準日結存"
 _HCT_HEADERS = ["客戶產品編號", "有效日期", "儲區類別", "可出數量", "庫存數量"]
 # 代工廠庫存核對報表：只有一個「庫存數量」欄，同時當作可用量與總庫存量；
 # 「批號」放到期日欄位(目前多為空白＝無到期日)，「合計／總計」小計列會被排除。
@@ -247,11 +251,15 @@ def detect_source(data: bytes, filename: str) -> str:
 
 def _import_source(data: bytes, filename: str, system: str,
                    detail: dict, item_totals: dict, anomalies: list,
-                   stats: SourceStats, location_ok, location_key=None) -> None:
+                   stats: SourceStats, location_ok, location_key=None,
+                   quantity_col: str | None = None) -> None:
     """location_key：通過 location_ok 的倉別轉成核對鍵（預設原樣）。
     M00 對帳用它把 NetSuite 側各種 M00 開頭代碼（M00倉、M001…）收斂成
     「M00」，跟 M00 報表側寫死的倉別對得上；否則前綴過濾放進來的列
-    會因為鍵不同而變成假的「僅單邊存在」差異。"""
+    會因為鍵不同而變成假的「僅單邊存在」差異。
+
+    quantity_col：改用指定欄位當數量(單欄兩用)，並列為必要欄位。
+    代工廠 × 採購核對版用它改取「基準日結存」。"""
     book = read_workbook(data, filename)
     if system == SYSTEM_HCT:
         required = _HCT_HEADERS
@@ -269,6 +277,8 @@ def _import_source(data: bytes, filename: str, system: str,
         required = _NS_PURCHASE_HEADERS
     else:
         required = _NS_HEADERS
+    if quantity_col is not None:
+        required = required + [quantity_col]
     match = _find_matching_sheet(book, required)
     if match is None:
         raise InventoryError(
@@ -337,6 +347,9 @@ def _import_source(data: bytes, filename: str, system: str,
         expiry_col, available_col, total_col = col("到期日"), col("項目計數 總和"), col("數量 總和")
         desc_col = col("項目")
         field_names = ("地點", "DR_料號", "到期日", "項目計數 總和", "數量 總和")
+    if quantity_col is not None:
+        available_col = total_col = col(quantity_col)
+        field_names = field_names[:3] + (quantity_col, quantity_col)
 
     def get(row: list, index: int | None) -> object:
         if index is None or index >= len(row):
@@ -558,8 +571,12 @@ def reconcile(ns_data: bytes, ns_name: str, hct_data: bytes, hct_name: str) -> I
     hct_stats = SourceStats(file_name=hct_name)
     ns_stats = SourceStats(file_name=ns_name)
 
+    # 代工廠報表是「庫存日期」當天的結存，NetSuite 採購核對版改用基準日結存核對。
+    ns_quantity_col = None
+    if ext_system == SYSTEM_CONTRACT and ns_system == SYSTEM_NETSUITE_PURCHASE:
+        ns_quantity_col = _NS_PURCHASE_OPENING_COL
     _import_source(ns_data, ns_name, ns_system, ns_detail, ns_items, anomalies, ns_stats,
-                   location_ok, location_key)
+                   location_ok, location_key, quantity_col=ns_quantity_col)
     _import_source(hct_data, hct_name, ext_system, hct_detail, hct_items, anomalies, hct_stats,
                    location_ok, location_key)
 
