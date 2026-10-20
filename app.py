@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -109,17 +110,28 @@ EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 st.set_page_config(page_title="HCT 工具箱", page_icon="📦", layout="wide")
 
 
-# 預設登入密碼的 SHA-256（程式碼裡只放雜湊，不放明文）。
-# 要換密碼可在 secrets 加 [auth] password = "新密碼"，會優先使用。
-DEFAULT_PASSWORD_SHA256 = "01401d58e91a9fd72f02a4f8ef602b14437f0dfd8b531f82f3188dabf6a0ca41"
+# ---- 密碼閘：開啟頁面一律要先輸入密碼（App 公開部署時的唯一門禁） ----
+# 內建密碼只存 SHA-256 雜湊，不放明文（程式碼會進 GitHub，明文進版控等於公開）。
+# 要換密碼：Secrets 頂層設 HCT_APP_PASSWORD（明文，平台端保管，優先於內建雜湊），
+# 或算好新雜湊換掉下面這行。
+APP_PW_SHA256 = "01401d58e91a9fd72f02a4f8ef602b14437f0dfd8b531f82f3188dabf6a0ca41"
+APP_PW_TRIES = 10
 
 
-def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _app_pw_ok(password: str) -> bool:
+    """Secrets 有設 HCT_APP_PASSWORD 就比對它，否則比對內建雜湊。"""
+    try:
+        override = str(st.secrets.get("HCT_APP_PASSWORD", "")).strip()
+    except FileNotFoundError:   # 本機沒有 secrets.toml
+        override = ""
+    if override:
+        return hmac.compare_digest(password.encode("utf-8"), override.encode("utf-8"))
+    got = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(got, APP_PW_SHA256)
 
 
 def _require_login() -> None:
-    """密碼閘門：沒登入就停在登入畫面，輸入正確密碼才顯示工具。"""
+    """沒登入就停在登入畫面；錯太多次鎖住這個連線，重新整理才能再試。"""
     if st.session_state.get("authed"):
         with st.sidebar:
             if st.button("登出", key="logout"):
@@ -127,20 +139,28 @@ def _require_login() -> None:
                 st.rerun()
         return
 
-    try:
-        expected = _sha256(str(st.secrets["auth"]["password"]))
-    except (KeyError, FileNotFoundError):
-        expected = DEFAULT_PASSWORD_SHA256
-
-    st.title("📦 HCT 工具箱")
-    with st.form("login"):
-        password = st.text_input("請輸入密碼", type="password")
-        submitted = st.form_submit_button("登入", type="primary")
-    if submitted:
-        if hmac.compare_digest(_sha256(password), expected):
-            st.session_state["authed"] = True
-            st.rerun()
-        st.error("密碼錯誤，請再試一次。")
+    fails = st.session_state.get("pw_fails", 0)
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        st.title("📦 HCT 工具箱")
+        if fails >= APP_PW_TRIES:
+            st.error("密碼錯誤次數過多，此連線已鎖定。請重新整理頁面後再試。")
+            st.stop()
+        # 用 form：只有按「登入」／Enter 才比對一次，頁面其他重跑不會重複扣次數
+        with st.form("login", border=True):
+            st.markdown("🔒 **請輸入使用密碼**")
+            password = st.text_input("密碼", type="password", label_visibility="collapsed",
+                                     placeholder="請輸入密碼")
+            submitted = st.form_submit_button("登入", type="primary", use_container_width=True)
+        if submitted:
+            if password and _app_pw_ok(password):
+                st.session_state["authed"] = True
+                st.session_state["pw_fails"] = 0
+                st.rerun()
+            fails += 1
+            st.session_state["pw_fails"] = fails
+            time.sleep(1.5)   # 減緩自動化暴力嘗試
+            st.error(f"密碼錯誤（剩餘嘗試次數 {APP_PW_TRIES - fails}）")
     st.stop()
 
 
