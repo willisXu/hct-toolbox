@@ -109,11 +109,17 @@ EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 st.set_page_config(page_title="HCT 工具箱", page_icon="📦", layout="wide")
 
 
-def _require_login() -> None:
-    """密碼閘門：密碼放 secrets 的 [auth] password，沒登入就停在登入畫面。
+# 預設登入密碼的 SHA-256（程式碼裡只放雜湊，不放明文）。
+# 要換密碼可在 secrets 加 [auth] password = "新密碼"，會優先使用。
+DEFAULT_PASSWORD_SHA256 = "01401d58e91a9fd72f02a4f8ef602b14437f0dfd8b531f82f3188dabf6a0ca41"
 
-    密碼沒設定時一律擋下（fail closed），避免雲端漏設 secrets 就整個公開。
-    """
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _require_login() -> None:
+    """密碼閘門：沒登入就停在登入畫面，輸入正確密碼才顯示工具。"""
     if st.session_state.get("authed"):
         with st.sidebar:
             if st.button("登出", key="logout"):
@@ -122,20 +128,16 @@ def _require_login() -> None:
         return
 
     try:
-        expected = str(st.secrets["auth"]["password"])
+        expected = _sha256(str(st.secrets["auth"]["password"]))
     except (KeyError, FileNotFoundError):
-        expected = ""
+        expected = DEFAULT_PASSWORD_SHA256
 
     st.title("📦 HCT 工具箱")
-    if not expected:
-        st.error("尚未設定登入密碼：請在 secrets 加上 [auth] 區塊的 password。")
-        st.stop()
-
     with st.form("login"):
         password = st.text_input("請輸入密碼", type="password")
         submitted = st.form_submit_button("登入", type="primary")
     if submitted:
-        if hmac.compare_digest(password.encode("utf-8"), expected.encode("utf-8")):
+        if hmac.compare_digest(_sha256(password), expected):
             st.session_state["authed"] = True
             st.rerun()
         st.error("密碼錯誤，請再試一次。")
