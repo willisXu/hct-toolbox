@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -106,6 +107,42 @@ def _memo_source_radio(key: str) -> str:
 EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 st.set_page_config(page_title="HCT 工具箱", page_icon="📦", layout="wide")
+
+
+def _require_login() -> None:
+    """密碼閘門：密碼放 secrets 的 [auth] password，沒登入就停在登入畫面。
+
+    密碼沒設定時一律擋下（fail closed），避免雲端漏設 secrets 就整個公開。
+    """
+    if st.session_state.get("authed"):
+        with st.sidebar:
+            if st.button("登出", key="logout"):
+                st.session_state.pop("authed", None)
+                st.rerun()
+        return
+
+    try:
+        expected = str(st.secrets["auth"]["password"])
+    except (KeyError, FileNotFoundError):
+        expected = ""
+
+    st.title("📦 HCT 工具箱")
+    if not expected:
+        st.error("尚未設定登入密碼：請在 secrets 加上 [auth] 區塊的 password。")
+        st.stop()
+
+    with st.form("login"):
+        password = st.text_input("請輸入密碼", type="password")
+        submitted = st.form_submit_button("登入", type="primary")
+    if submitted:
+        if hmac.compare_digest(password.encode("utf-8"), expected.encode("utf-8")):
+            st.session_state["authed"] = True
+            st.rerun()
+        st.error("密碼錯誤，請再試一次。")
+    st.stop()
+
+
+_require_login()
 
 st.title("📦 HCT 工具箱")
 st.caption("訂單轉換 / 調撥單轉換 / 表格核對 / 退貨核對 / 庫存核對 — 上傳檔案 → 按按鈕 → 下載結果")
